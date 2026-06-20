@@ -2,6 +2,27 @@
 
 SimplePass is a Windows/macOS desktop app for sending links, files, and 1:1 chat messages between trusted computers on the same local network.
 
+## Download & Install
+
+Grab the latest installer: **[github.com/jawadkhan2/simplepass/releases/latest](https://github.com/jawadkhan2/simplepass/releases/latest)**
+
+| OS | File to download |
+|----|------------------|
+| Windows | `SimplePass_<version>_x64-setup.exe` |
+| Mac (Apple Silicon — M1/M2/M3+) | `SimplePass_<version>_aarch64.dmg` |
+| Mac (Intel) | `SimplePass_<version>_x64.dmg` |
+
+The app is not yet code-signed, so the OS shows a one-time warning on first run:
+
+- **Windows:** SmartScreen popup → click **More info** → **Run anyway**.
+- **Mac:** open the `.dmg`, drag SimplePass into Applications, then **right-click the app → Open → Open**. If macOS still refuses ("damaged" / "can't be opened"), clear the quarantine flag once:
+
+  ```bash
+  xattr -dr com.apple.quarantine "/Applications/SimplePass.app"
+  ```
+
+After the first install, SimplePass updates itself automatically — no need to download again.
+
 ## Current Features
 
 - Tauri desktop app with React/TypeScript UI.
