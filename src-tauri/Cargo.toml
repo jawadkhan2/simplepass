@@ -1,0 +1,35 @@
+[package]
+name = "simplepass"
+version = "0.1.0"
+description = "AirDrop-style local network sharing for Windows and macOS"
+authors = ["SimplePass"]
+edition = "2021"
+
+[lib]
+name = "simplepass_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.1.1", features = [] }
+
+[dependencies]
+chrono = { version = "0.4.38", features = ["serde"] }
+base64 = "0.22.1"
+chacha20poly1305 = "0.10.1"
+dirs = "5.0.1"
+rand = "0.8.5"
+open = "5.3.0"
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.133"
+sha2 = "0.10.8"
+tauri = { version = "2.1.1", features = ["tray-icon"] }
+tauri-plugin-autostart = "2.0.2"
+tauri-plugin-notification = "2.0.1"
+tauri-plugin-process = "2.0.0"
+thiserror = "2.0.3"
+uuid = { version = "1.11.0", features = ["v4", "serde"] }
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+
+# Desktop-only: in-app over-the-air updates.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2.0.0"

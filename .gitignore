@@ -1,0 +1,11 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+*.log
+*.tmp
+.DS_Store
+
+# Updater signing keys — never commit
+*.key
+*.key.pub
