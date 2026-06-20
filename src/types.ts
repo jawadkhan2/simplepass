@@ -6,6 +6,7 @@ export interface SetupState {
   deviceId: string;
   deviceName: string;
   startAtLogin: boolean;
+  avatar?: string | null;
 }
 
 export interface PeerDevice {
@@ -16,6 +17,7 @@ export interface PeerDevice {
   os: string;
   status: PeerStatus;
   trustState: TrustState;
+  avatar?: string | null;
   lastSeen: number;
 }
 
@@ -25,6 +27,16 @@ export interface ChatMessage {
   direction: "sent" | "received";
   text: string;
   createdAt: number;
+  kind: "text" | "file" | "link";
+  fileName?: string | null;
+  fileSize?: number | null;
+  filePath?: string | null;
+  url?: string | null;
+}
+
+export interface TypingSignal {
+  peerId: string;
+  isTyping: boolean;
 }
 
 export interface TransferProgress {

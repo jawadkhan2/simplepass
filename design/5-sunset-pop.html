@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SimplePass — Sunset Pop</title>
+<style>
+  :root {
+    --bg:#1a1430; --card:#241a44; --card2:#2c2052; --line:rgba(255,255,255,0.08);
+    --txt:#f3edff; --txt-dim:#b3a6d6;
+    --coral:#ff6b8b; --orange:#ff9558; --purple:#a16bff; --pink:#ff5fd2; --cyan:#43e0d8;
+    --grad:linear-gradient(120deg,#ff6b8b,#ff9558);
+    --grad2:linear-gradient(120deg,#a16bff,#ff5fd2);
+    font-family:"Inter",ui-sans-serif,system-ui,"Segoe UI",sans-serif;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { min-height:100vh; display:grid; place-items:center; padding:28px; color:var(--txt);
+    background:radial-gradient(800px 500px at 90% 0%,rgba(255,107,139,0.25),transparent 55%),
+               radial-gradient(800px 600px at 0% 100%,rgba(161,107,255,0.28),transparent 55%),#100b22; }
+  .window {
+    width:1120px; max-width:100%; height:760px; border-radius:24px; overflow:hidden;
+    background:var(--bg); border:1px solid var(--line);
+    box-shadow:0 40px 100px rgba(0,0,0,0.5);
+    display:grid; grid-template-rows:52px 1fr;
+  }
+  .titlebar { display:flex; align-items:center; gap:14px; padding:0 18px; -webkit-app-region:drag;
+    background:linear-gradient(90deg,rgba(255,107,139,0.12),rgba(161,107,255,0.12)); border-bottom:1px solid var(--line); }
+  .logo { width:30px; height:30px; border-radius:9px; background:var(--grad); display:grid; place-items:center; font-size:16px; box-shadow:0 6px 18px rgba(255,107,139,0.4); }
+  .tb-title { font-size:15px; font-weight:800; letter-spacing:-.2px; }
+  .tb-spacer{flex:1;}
+  .lights { display:flex; gap:9px; }
+  .lights i { width:13px; height:13px; border-radius:50%; }
+  .lights .c{background:var(--coral);} .lights .m{background:var(--orange);} .lights .x{background:var(--cyan);}
+
+  .body { display:grid; grid-template-columns:1.5fr 1fr; min-height:0; }
+  .devices { padding:26px 28px; overflow:auto; }
+  .head { display:flex; align-items:center; justify-content:space-between; }
+  .head h1 { font-size:28px; font-weight:900; letter-spacing:-.8px; background:var(--grad); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .pill { font-size:12px; font-weight:800; color:#fff; background:var(--grad2); padding:7px 14px; border-radius:999px; box-shadow:0 6px 18px rgba(161,107,255,0.4); }
+  .sub { color:var(--txt-dim); font-size:13.5px; margin:6px 0 22px; }
+
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  .tile { position:relative; border-radius:22px; padding:22px; background:var(--card); border:1px solid var(--line); transition:.2s; overflow:hidden; }
+  .tile::after { content:""; position:absolute; inset:0; background:var(--grad2); opacity:0; transition:.2s; z-index:0; }
+  .tile > * { position:relative; z-index:1; }
+  .tile:hover { transform:translateY(-4px) scale(1.01); }
+  .tile.sel { border-color:transparent; background:var(--card2); box-shadow:0 0 0 2px var(--pink), 0 18px 40px rgba(255,95,210,0.3); }
+  .ava { width:60px; height:60px; border-radius:18px; display:grid; place-items:center; font-size:28px; background:var(--grad); margin-bottom:14px; box-shadow:0 10px 26px rgba(255,107,139,0.35); }
+  .ava.alt { background:var(--grad2); box-shadow:0 10px 26px rgba(161,107,255,0.35); }
+  .ava.off { background:#2c2052; box-shadow:none; filter:grayscale(0.6); }
+  .tile h3 { font-size:18px; font-weight:800; }
+  .tile p { font-size:12.5px; color:var(--txt-dim); margin-top:3px; }
+  .stat { margin-top:12px; font-size:11.5px; font-weight:700; display:inline-flex; align-items:center; gap:7px; padding:4px 11px; border-radius:999px; background:rgba(67,224,216,0.15); color:var(--cyan); }
+  .stat::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--cyan); }
+  .stat.off { background:rgba(255,255,255,0.07); color:var(--txt-dim); } .stat.off::before{ background:var(--txt-dim); }
+  .menu { position:absolute; top:18px; right:18px; color:var(--txt-dim); z-index:2; }
+  .act { margin-top:18px; }
+  .btn { width:100%; padding:13px; border-radius:15px; font-size:14px; font-weight:800; border:0; }
+  .btn.prim { background:var(--grad); color:#fff; box-shadow:0 10px 24px rgba(255,107,139,0.4); }
+  .btn.ghost { background:rgba(255,255,255,0.07); color:var(--txt); border:1.5px solid var(--line); }
+  .btn.pend { background:rgba(255,255,255,0.05); color:var(--txt-dim); }
+
+  .chat { border-left:1px solid var(--line); background:rgba(255,255,255,0.02); display:flex; flex-direction:column; min-height:0; }
+  .ch-head { padding:20px 22px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; }
+  .ch-head h2 { font-size:17px; font-weight:800; } .ch-head span { font-size:11.5px; color:var(--cyan); font-weight:700; }
+  .msgs { flex:1; overflow:auto; padding:18px 20px; display:flex; flex-direction:column; gap:11px; }
+  .msg { max-width:78%; padding:12px 15px; border-radius:18px; font-size:13.5px; line-height:1.45; }
+  .msg.recv { align-self:flex-start; background:var(--card2); border-bottom-left-radius:5px; }
+  .msg.sent { align-self:flex-end; background:var(--grad); color:#fff; border-bottom-right-radius:5px; box-shadow:0 8px 20px rgba(255,107,139,0.3); }
+  .composer { padding:16px; border-top:1px solid var(--line); display:flex; gap:10px; }
+  .composer input { flex:1; background:var(--card); border:1px solid var(--line); border-radius:15px; padding:13px 16px; color:var(--txt); outline:none; }
+  .composer .send { background:var(--grad2); color:#fff; border-radius:15px; padding:0 22px; font-weight:800; box-shadow:0 8px 20px rgba(161,107,255,0.4); }
+
+  .dock { grid-column:1 / -1; border-top:1px solid var(--line); padding:16px 28px; display:flex; gap:18px; background:rgba(0,0,0,0.2); }
+  .xfer { flex:1; }
+  .xline { display:flex; justify-content:space-between; font-size:13px; font-weight:700; margin-bottom:8px; }
+  .xline small { color:var(--txt-dim); font-weight:600; }
+  .bar { height:9px; border-radius:999px; background:rgba(255,255,255,0.09); overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--grad); border-radius:999px; }
+  .bar.b2 i { background:var(--grad2); }
+</style>
+</head>
+<body>
+  <div class="window">
+    <div class="titlebar">
+      <div class="logo">⚡</div>
+      <span class="tb-title">SimplePass</span>
+      <span class="tb-spacer"></span>
+      <div class="lights"><i class="c"></i><i class="m"></i><i class="x"></i></div>
+    </div>
+    <div class="body">
+      <section class="devices">
+        <div class="head">
+          <h1>Nearby</h1>
+          <span class="pill">3 ONLINE</span>
+        </div>
+        <p class="sub">Jawad-Desktop · drag files onto a computer to beam them over ⚡</p>
+        <div class="grid">
+          <article class="tile sel">
+            <div class="menu">🗑</div>
+            <div class="ava">💻</div>
+            <h3>Studio-Mac</h3><p>macOS · 192.168.1.21</p>
+            <span class="stat">online · paired</span>
+            <div class="act"><button class="btn prim">💬 Chat</button></div>
+          </article>
+          <article class="tile">
+            <div class="menu">⋯</div>
+            <div class="ava alt">🖥</div>
+            <h3>Office-PC</h3><p>Windows 11 · 192.168.1.44</p>
+            <span class="stat">online</span>
+            <div class="act"><button class="btn ghost">＋ Pair</button></div>
+          </article>
+          <article class="tile">
+            <div class="menu">⋯</div>
+            <div class="ava">🐧</div>
+            <h3>Linux-Rig</h3><p>Ubuntu · 192.168.1.9</p>
+            <span class="stat">online</span>
+            <div class="act"><button class="btn pend">✓ Pending…</button></div>
+          </article>
+          <article class="tile">
+            <div class="menu">🗑</div>
+            <div class="ava off">💻</div>
+            <h3>Bedroom-Laptop</h3><p>Windows · seen 2h ago</p>
+            <span class="stat off">offline · paired</span>
+            <div class="act"><button class="btn ghost">💬 Chat</button></div>
+          </article>
+        </div>
+      </section>
+      <aside class="chat">
+        <div class="ch-head"><h2>Studio-Mac</h2><span>● ONLINE</span></div>
+        <div class="msgs">
+          <div class="msg recv">sending the design files now 🎨</div>
+          <div class="msg sent">drop em on the card ⚡</div>
+          <div class="msg recv">done! link too 👇</div>
+          <div class="msg recv">https://figma.com/file/sunset</div>
+          <div class="msg sent">🔥🔥🔥</div>
+        </div>
+        <form class="composer" onsubmit="return false">
+          <input placeholder="Message Studio-Mac" /><button class="send">Send</button>
+        </form>
+      </aside>
+      <div class="dock">
+        <div class="xfer">
+          <div class="xline"><span>Studio-Mac · sunset-mockups.zip</span><small>78% · sending</small></div>
+          <div class="bar"><i style="width:78%"></i></div>
+        </div>
+        <div class="xfer">
+          <div class="xline"><span>Office-PC · figma link</span><small>complete ✓</small></div>
+          <div class="bar b2"><i style="width:100%"></i></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

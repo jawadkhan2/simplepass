@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SimplePass — Icon Concepts</title>
+<style>
+  :root {
+    --bg: #0f1216;
+    --card: #171b21;
+    --line: #232a33;
+    --text: #e6eaf0;
+    --muted: #8b95a4;
+    --brand: #4f8cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 15px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    padding: 48px 32px;
+  }
+  header { max-width: 980px; margin: 0 auto 32px; }
+  h1 { margin: 0 0 6px; font-size: 22px; }
+  header p { margin: 0; color: var(--muted); }
+  .grid {
+    max-width: 980px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 20px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .stage {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 20px;
+    padding: 18px 0;
+  }
+  /* light tile to judge contrast on light themes too */
+  .tile {
+    width: 88px; height: 88px;
+    border-radius: 20px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .tile.dark  { background: #0b0d10; border: 1px solid var(--line); }
+  .tile.light { background: #f4f6fa; }
+  .small { width: 28px; height: 28px; }
+  .meta { display: flex; align-items: baseline; gap: 10px; }
+  .num {
+    font-weight: 700; color: var(--brand);
+    font-variant-numeric: tabular-nums;
+  }
+  .name { font-weight: 600; }
+  .desc { color: var(--muted); font-size: 13px; margin: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SimplePass — icon concepts</h1>
+  <p>Send links, files &amp; 1:1 chat between devices. Pick one number; I wire it into the app (favicon, header, Tauri icon).</p>
+</header>
+
+<div class="grid">
+
+  <!-- 1: Paper plane through ring (send / connection) -->
+  <div class="card">
+    <div class="stage">
+      <div class="tile dark">
+        <svg width="56" height="56" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="24" cy="24" r="20" stroke="#4f8cff" stroke-width="3"/>
+          <path d="M16 24l16-7-5 16-3.5-6.5L16 24z" fill="#4f8cff"/>
+        </svg>
+      </div>
+      <div class="tile light">
+        <svg class="small" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="24" cy="24" r="20" stroke="#2563eb" stroke-width="3"/>
+          <path d="M16 24l16-7-5 16-3.5-6.5L16 24z" fill="#2563eb"/>
+        </svg>
+      </div>
+    </div>
+    <div class="meta"><span class="num">1</span><span class="name">Orbit Send</span></div>
+    <p class="desc">Paper plane inside a ring — sending + a closed loop between two devices.</p>
+  </div>
+
+  <!-- 2: Two linked chevrons / handoff -->
+  <div class="card">
+    <div class="stage">
+      <div class="tile dark">
+        <svg width="56" height="56" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M20 12l-10 12 10 12" stroke="#4f8cff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M28 12l10 12-10 12" stroke="#7aa9ff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div class="tile light">
+        <svg class="small" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M20 12l-10 12 10 12" stroke="#2563eb" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M28 12l10 12-10 12" stroke="#60a5fa" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+    </div>
+    <div class="meta"><span class="num">2</span><span class="name">Handoff</span></div>
+    <p class="desc">Two mirrored chevrons facing in — data passing between peers. Minimal, scales tiny.</p>
+  </div>
+
+  <!-- 3: Chat bubble + link -->
+  <div class="card">
+    <div class="stage">
+      <div class="tile dark">
+        <svg width="56" height="56" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M8 14a6 6 0 016-6h20a6 6 0 016 6v12a6 6 0 01-6 6H20l-9 7v-7a6 6 0 01-3-5V14z" fill="#4f8cff"/>
+          <path d="M21 22l6-6m-1 9l3-3a3 3 0 00-4-4l-1 1m-3 9l-3 3a3 3 0 01-4-4l1-1" stroke="#0b0d10" stroke-width="2.4" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div class="tile light">
+        <svg class="small" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M8 14a6 6 0 016-6h20a6 6 0 016 6v12a6 6 0 01-6 6H20l-9 7v-7a6 6 0 01-3-5V14z" fill="#2563eb"/>
+          <path d="M21 22l6-6m-1 9l3-3a3 3 0 00-4-4l-1 1m-3 9l-3 3a3 3 0 01-4-4l1-1" stroke="#f4f6fa" stroke-width="2.4" stroke-linecap="round"/>
+        </svg>
+      </div>
+    </div>
+    <div class="meta"><span class="num">3</span><span class="name">Chat Link</span></div>
+    <p class="desc">Speech bubble holding a link glyph — covers chat + link/file sharing in one mark.</p>
+  </div>
+
+  <!-- 4: Lightning P monogram -->
+  <div class="card">
+    <div class="stage">
+      <div class="tile dark">
+        <svg width="56" height="56" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="6" y="6" width="36" height="36" rx="10" fill="#4f8cff"/>
+          <path d="M26 13l-9 13h6l-3 9 11-14h-7l2-8z" fill="#0b0d10"/>
+        </svg>
+      </div>
+      <div class="tile light">
+        <svg class="small" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="6" y="6" width="36" height="36" rx="10" fill="#2563eb"/>
+          <path d="M26 13l-9 13h6l-3 9 11-14h-7l2-8z" fill="#f4f6fa"/>
+        </svg>
+      </div>
+    </div>
+    <div class="meta"><span class="num">4</span><span class="name">Quick Bolt</span></div>
+    <p class="desc">Rounded app tile with a lightning bolt — speed of an instant pass. Strong at favicon size.</p>
+  </div>
+
+  <!-- 5: Two nodes + arrow (P-shaped node) -->
+  <div class="card">
+    <div class="stage">
+      <div class="tile dark">
+        <svg width="56" height="56" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="12" cy="24" r="6" fill="#7aa9ff"/>
+          <circle cx="36" cy="24" r="6" fill="#4f8cff"/>
+          <path d="M18 24h12m-4-4l4 4-4 4" stroke="#e6eaf0" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div class="tile light">
+        <svg class="small" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="12" cy="24" r="6" fill="#60a5fa"/>
+          <circle cx="36" cy="24" r="6" fill="#2563eb"/>
+          <path d="M18 24h12m-4-4l4 4-4 4" stroke="#0b0d10" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+    </div>
+    <div class="meta"><span class="num">5</span><span class="name">Peer Arrow</span></div>
+    <p class="desc">Two device nodes with an arrow between — literal 1:1 transfer. Reads clearly at any size.</p>
+  </div>
+
+  <!-- 6: Nodes forming a P monogram -->
+  <div class="card">
+    <div class="stage">
+      <div class="tile dark">
+        <svg width="56" height="56" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M15 11V39M15 11H31M31 11V21M31 21H15" stroke="#3a5a8c" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="15" cy="11" r="4.5" fill="#7aa9ff"/>
+          <circle cx="31" cy="11" r="4.5" fill="#4f8cff"/>
+          <circle cx="31" cy="21" r="4.5" fill="#4f8cff"/>
+          <circle cx="15" cy="21" r="4.5" fill="#7aa9ff"/>
+          <circle cx="15" cy="39" r="4.5" fill="#4f8cff"/>
+        </svg>
+      </div>
+      <div class="tile light">
+        <svg class="small" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M15 11V39M15 11H31M31 11V21M31 21H15" stroke="#9bb8e6" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="15" cy="11" r="4.5" fill="#60a5fa"/>
+          <circle cx="31" cy="11" r="4.5" fill="#2563eb"/>
+          <circle cx="31" cy="21" r="4.5" fill="#2563eb"/>
+          <circle cx="15" cy="21" r="4.5" fill="#60a5fa"/>
+          <circle cx="15" cy="39" r="4.5" fill="#2563eb"/>
+        </svg>
+      </div>
+    </div>
+    <div class="meta"><span class="num">6</span><span class="name">Node P</span></div>
+    <p class="desc">Five nodes wired into a "P" — SimplePass monogram built from the network graph itself.</p>
+  </div>
+
+  <!-- 7: Two nodes + signal pulse between -->
+  <div class="card">
+    <div class="stage">
+      <div class="tile dark">
+        <svg width="56" height="56" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M14 24h4l3-7 4 14 3-7h6" stroke="#e6eaf0" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="10" cy="24" r="5" fill="#7aa9ff"/>
+          <circle cx="38" cy="24" r="5" fill="#4f8cff"/>
+        </svg>
+      </div>
+      <div class="tile light">
+        <svg class="small" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M14 24h4l3-7 4 14 3-7h6" stroke="#0b0d10" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          <circle cx="10" cy="24" r="5" fill="#60a5fa"/>
+          <circle cx="38" cy="24" r="5" fill="#2563eb"/>
+        </svg>
+      </div>
+    </div>
+    <div class="meta"><span class="num">7</span><span class="name">Pulse Link</span></div>
+    <p class="desc">Two nodes with a live signal pulse between them — transfer in motion, not just a static line.</p>
+  </div>
+
+</div>
+</body>
+</html>

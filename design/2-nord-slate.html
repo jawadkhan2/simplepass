@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SimplePass — Nord Slate</title>
+<style>
+  :root {
+    --p0:#2e3440; --p1:#3b4252; --p2:#434c5e; --p3:#4c566a;
+    --s4:#d8dee9; --s5:#e5e9f0; --s6:#eceff4;
+    --frost1:#8fbcbb; --frost2:#88c0d0; --frost3:#81a1c1; --frost4:#5e81ac;
+    --aurora-g:#a3be8c; --aurora-y:#ebcb8b; --aurora-r:#bf616a; --aurora-p:#b48ead;
+    font-family: "Inter", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { min-height:100vh; display:grid; place-items:center; background:#1c2026; padding:28px; color:var(--s5); }
+  .window {
+    width:1120px; max-width:100%; height:760px; border-radius:10px; overflow:hidden;
+    border:1px solid #20252e; background:var(--p0);
+    box-shadow:0 30px 90px rgba(0,0,0,0.55);
+    display:grid; grid-template-rows:38px 1fr;
+  }
+  /* windows-style titlebar */
+  .titlebar { display:flex; align-items:center; background:var(--p1); border-bottom:1px solid #20252e; -webkit-app-region:drag; }
+  .tb-left { display:flex; align-items:center; gap:10px; padding:0 14px; }
+  .tb-logo { width:18px; height:18px; border-radius:5px; background:linear-gradient(135deg,var(--frost2),var(--frost4)); }
+  .tb-title { font-size:12.5px; font-weight:600; color:var(--s4); }
+  .tb-spacer { flex:1; }
+  .wbtns { display:flex; height:38px; }
+  .wbtns button { width:46px; border:0; background:transparent; color:var(--s4); font-size:13px; display:grid; place-items:center; }
+  .wbtns button:hover { background:var(--p2); }
+  .wbtns .close:hover { background:var(--aurora-r); color:#fff; }
+
+  .body { display:grid; grid-template-columns:230px 1fr 320px; min-height:0; }
+  .side { background:var(--p1); border-right:1px solid #2b313c; padding:18px 14px; display:flex; flex-direction:column; gap:6px; }
+  .me { display:flex; align-items:center; gap:10px; padding:10px; border-radius:8px; background:var(--p2); margin-bottom:14px; }
+  .me .ava { width:34px; height:34px; border-radius:8px; background:linear-gradient(135deg,var(--frost1),var(--frost3)); display:grid; place-items:center; color:#2e3440; font-weight:700; }
+  .me b { font-size:13px; } .me span { font-size:11px; color:var(--frost2); display:block; }
+  .navlbl { font-size:10.5px; text-transform:uppercase; letter-spacing:1px; color:var(--p3); padding:8px 8px 4px; }
+  .nav { display:flex; align-items:center; gap:10px; padding:9px 10px; border-radius:8px; font-size:13px; color:var(--s4); }
+  .nav:hover { background:var(--p2); } .nav.on { background:var(--frost4); color:#fff; }
+  .side .foot { margin-top:auto; }
+
+  .main { padding:22px 26px; overflow:auto; }
+  .head { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+  .head h1 { font-size:18px; font-weight:700; }
+  .head .count { font-size:12px; color:var(--frost2); background:rgba(136,192,208,0.12); padding:4px 10px; border-radius:6px; }
+  .head .sub { color:var(--p3); font-size:12px; margin:2px 0 18px; }
+  .list { display:flex; flex-direction:column; gap:10px; }
+  .row {
+    display:grid; grid-template-columns:46px 1fr auto; gap:14px; align-items:center;
+    padding:14px 16px; border-radius:10px; background:var(--p1); border:1px solid #2b313c;
+  }
+  .row.sel { border-color:var(--frost2); background:var(--p2); }
+  .row .ava { width:46px; height:46px; border-radius:10px; background:var(--p2); display:grid; place-items:center; font-size:20px; }
+  .row.sel .ava { background:linear-gradient(135deg,var(--frost2),var(--frost4)); }
+  .row h3 { font-size:14px; } .row p { font-size:12px; color:var(--p3); margin-top:2px; }
+  .stat { font-size:11px; display:inline-flex; align-items:center; gap:6px; margin-top:5px; color:var(--aurora-g); }
+  .stat::before { content:""; width:7px; height:7px; border-radius:50%; background:var(--aurora-g); }
+  .stat.off { color:var(--p3); } .stat.off::before { background:var(--p3); }
+  .btn { padding:8px 16px; border-radius:8px; font-size:12.5px; font-weight:600; border:1px solid transparent; }
+  .btn.prim { background:var(--frost4); color:#fff; } .btn.prim:hover { background:var(--frost3); }
+  .btn.ghost { background:transparent; border-color:var(--p3); color:var(--s4); }
+  .btn.pend { background:var(--p2); color:var(--p3); }
+
+  .chat { background:var(--p1); border-left:1px solid #2b313c; display:flex; flex-direction:column; min-height:0; }
+  .ch-head { padding:16px 18px; border-bottom:1px solid #2b313c; }
+  .ch-head h2 { font-size:14px; } .ch-head span { font-size:11px; color:var(--aurora-g); }
+  .msgs { flex:1; overflow:auto; padding:16px; display:flex; flex-direction:column; gap:9px; }
+  .msg { max-width:80%; font-size:13px; padding:9px 12px; border-radius:12px; line-height:1.4; }
+  .msg.recv { align-self:flex-start; background:var(--p2); border-bottom-left-radius:4px; }
+  .msg.sent { align-self:flex-end; background:var(--frost4); color:#fff; border-bottom-right-radius:4px; }
+  .composer { padding:12px; border-top:1px solid #2b313c; display:flex; gap:8px; }
+  .composer input { flex:1; background:var(--p0); border:1px solid var(--p3); color:var(--s5); border-radius:8px; padding:10px 12px; outline:none; }
+  .composer .send { background:var(--frost4); color:#fff; border-radius:8px; padding:0 16px; font-weight:600; }
+
+  .dock { grid-column:1 / -1; background:var(--p1); border-top:1px solid #2b313c; padding:10px 26px; display:flex; gap:14px; }
+  .xfer { flex:1; background:var(--p0); border:1px solid #2b313c; border-radius:8px; padding:9px 14px; }
+  .xline { display:flex; justify-content:space-between; font-size:12px; margin-bottom:6px; }
+  .xline small { color:var(--p3); }
+  .bar { height:5px; border-radius:999px; background:var(--p2); overflow:hidden; }
+  .bar i { display:block; height:100%; background:linear-gradient(90deg,var(--frost2),var(--frost4)); }
+</style>
+</head>
+<body>
+  <div class="window">
+    <div class="titlebar">
+      <div class="tb-left"><div class="tb-logo"></div><span class="tb-title">SimplePass</span></div>
+      <div class="tb-spacer"></div>
+      <div class="wbtns"><button>—</button><button>▢</button><button class="close">✕</button></div>
+    </div>
+    <div class="body">
+      <nav class="side">
+        <div class="me">
+          <div class="ava">J</div>
+          <div><b>Jawad-Desktop</b><span>● this device</span></div>
+        </div>
+        <div class="navlbl">Workspace</div>
+        <a class="nav on">🖥 Devices</a>
+        <a class="nav">💬 Messages</a>
+        <a class="nav">⇅ Transfers</a>
+        <div class="navlbl">System</div>
+        <a class="nav">🛡 Trusted</a>
+        <a class="nav foot">⚙ Settings</a>
+      </nav>
+      <main class="main">
+        <div class="head"><h1>Devices</h1><span class="count">3 online</span></div>
+        <div class="sub">Computers discovered on your local network</div>
+        <div class="list">
+          <div class="row sel">
+            <div class="ava">💻</div>
+            <div><h3>Studio-Mac</h3><p>macOS · 192.168.1.21</p><span class="stat">online · paired</span></div>
+            <button class="btn prim">Chat</button>
+          </div>
+          <div class="row">
+            <div class="ava">🖥</div>
+            <div><h3>Office-PC</h3><p>Windows 11 · 192.168.1.44</p><span class="stat">online</span></div>
+            <button class="btn ghost">Pair</button>
+          </div>
+          <div class="row">
+            <div class="ava">🐧</div>
+            <div><h3>Linux-Rig</h3><p>Ubuntu · 192.168.1.9</p><span class="stat">online</span></div>
+            <button class="btn pend">Pending…</button>
+          </div>
+          <div class="row">
+            <div class="ava">💻</div>
+            <div><h3>Bedroom-Laptop</h3><p>Windows · last seen 2h ago</p><span class="stat off">offline · paired</span></div>
+            <button class="btn ghost">Chat</button>
+          </div>
+        </div>
+      </main>
+      <aside class="chat">
+        <div class="ch-head"><h2>Studio-Mac</h2><span>● online</span></div>
+        <div class="msgs">
+          <div class="msg recv">Sending the design files now</div>
+          <div class="msg sent">Drop them on the device row</div>
+          <div class="msg recv">Done ✅ here's the link too</div>
+          <div class="msg recv">https://figma.com/file/nord</div>
+          <div class="msg sent">Pulling it up</div>
+        </div>
+        <form class="composer" onsubmit="return false">
+          <input placeholder="Message Studio-Mac" /><button class="send">Send</button>
+        </form>
+      </aside>
+      <div class="dock">
+        <div class="xfer">
+          <div class="xline"><b>Studio-Mac · nord-mockups.zip</b><small>72% · sending</small></div>
+          <div class="bar"><i style="width:72%"></i></div>
+        </div>
+        <div class="xfer">
+          <div class="xline"><b>Office-PC · figma link</b><small>complete</small></div>
+          <div class="bar"><i style="width:100%"></i></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SimplePass — Warm Paper</title>
+<style>
+  :root {
+    --paper:#f4ede1; --card:#fbf7f0; --ink:#3b342c; --ink-dim:#8a7d6b;
+    --clay:#c8643c; --clay-soft:#e8a07e; --sage:#7d8a5c; --gold:#d8a13a;
+    --line:#e4d9c6;
+    font-family:"Inter", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { min-height:100vh; display:grid; place-items:center; background:#e7dccb; padding:28px; color:var(--ink); }
+  .window {
+    width:1120px; max-width:100%; height:760px; border-radius:20px; overflow:hidden;
+    background:var(--paper); border:1px solid var(--line);
+    box-shadow:0 30px 80px rgba(90,70,45,0.28);
+    display:grid; grid-template-rows:46px 1fr;
+  }
+  .titlebar { display:flex; align-items:center; gap:12px; padding:0 16px; background:var(--card); border-bottom:1px solid var(--line); -webkit-app-region:drag; }
+  .lights { display:flex; gap:8px; }
+  .lights i { width:12px; height:12px; border-radius:50%; }
+  .lights .c{background:#e0795f;} .lights .m{background:#e0b85f;} .lights .x{background:#9cb069;}
+  .tb-title { font-size:13px; font-weight:700; letter-spacing:.2px; }
+  .tb-title span { color:var(--clay); }
+  .tb-spacer { flex:1; } .tb-sub { font-size:12px; color:var(--ink-dim); }
+
+  .body { display:grid; grid-template-columns:1.5fr 1fr; min-height:0; }
+  .devices { padding:26px 28px; overflow:auto; }
+  .head { display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; }
+  .head h1 { font-size:23px; font-weight:800; letter-spacing:-.4px; }
+  .pill { font-size:12px; font-weight:600; color:var(--sage); background:rgba(125,138,92,0.14); padding:5px 12px; border-radius:999px; }
+  .sub { color:var(--ink-dim); font-size:13px; margin-bottom:20px; }
+  .iconbtn { width:38px; height:38px; border-radius:12px; background:var(--card); border:1px solid var(--line); display:grid; place-items:center; }
+
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .tile { position:relative; background:var(--card); border:1px solid var(--line); border-radius:18px; padding:20px; box-shadow:0 4px 14px rgba(120,95,60,0.06); transition:.18s; }
+  .tile:hover { transform:translateY(-3px); box-shadow:0 12px 28px rgba(120,95,60,0.14); }
+  .tile.sel { border-color:var(--clay); box-shadow:0 0 0 2px rgba(200,100,60,0.25), 0 12px 28px rgba(120,95,60,0.14); }
+  .ava { width:54px; height:54px; border-radius:16px; display:grid; place-items:center; font-size:24px; background:linear-gradient(135deg,var(--clay-soft),var(--clay)); color:#fff; margin-bottom:14px; }
+  .ava.off { background:#e9ddca; color:var(--ink-dim); }
+  .tile h3 { font-size:16px; font-weight:700; }
+  .tile p { font-size:12.5px; color:var(--ink-dim); margin-top:3px; }
+  .stat { margin-top:10px; font-size:11.5px; font-weight:600; display:inline-flex; align-items:center; gap:6px; color:var(--sage); }
+  .stat::before { content:""; width:8px; height:8px; border-radius:50%; background:var(--sage); }
+  .stat.off { color:var(--ink-dim); } .stat.off::before { background:#c9bca6; }
+  .menu { position:absolute; top:16px; right:16px; color:var(--ink-dim); }
+  .act { margin-top:16px; }
+  .btn { width:100%; padding:11px; border-radius:13px; font-size:13.5px; font-weight:700; border:1.5px solid transparent; }
+  .btn.prim { background:var(--clay); color:#fff; }
+  .btn.ghost { background:transparent; border-color:var(--clay); color:var(--clay); }
+  .btn.pend { background:#efe7d8; color:var(--ink-dim); }
+
+  .chat { border-left:1px solid var(--line); background:var(--paper); display:flex; flex-direction:column; min-height:0; }
+  .ch-head { padding:20px 22px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; }
+  .ch-head h2 { font-size:16px; font-weight:700; } .ch-head span { font-size:12px; color:var(--sage); font-weight:600; }
+  .msgs { flex:1; overflow:auto; padding:18px 20px; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width:78%; padding:11px 14px; border-radius:16px; font-size:13.5px; line-height:1.45; }
+  .msg.recv { align-self:flex-start; background:var(--card); border:1px solid var(--line); border-bottom-left-radius:5px; }
+  .msg.sent { align-self:flex-end; background:var(--clay); color:#fff; border-bottom-right-radius:5px; }
+  .composer { padding:16px; border-top:1px solid var(--line); display:flex; gap:10px; }
+  .composer input { flex:1; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:12px 15px; outline:none; color:var(--ink); }
+  .composer .send { background:var(--clay); color:#fff; border-radius:14px; padding:0 20px; font-weight:700; }
+
+  .dock { grid-column:1 / -1; border-top:1px solid var(--line); background:var(--card); padding:14px 28px; display:flex; gap:16px; }
+  .xfer { flex:1; }
+  .xline { display:flex; justify-content:space-between; font-size:13px; margin-bottom:7px; font-weight:600; }
+  .xline small { color:var(--ink-dim); font-weight:500; }
+  .bar { height:7px; border-radius:999px; background:#ece3d3; overflow:hidden; }
+  .bar i { display:block; height:100%; background:linear-gradient(90deg,var(--gold),var(--clay)); }
+</style>
+</head>
+<body>
+  <div class="window">
+    <div class="titlebar">
+      <div class="lights"><i class="c"></i><i class="m"></i><i class="x"></i></div>
+      <span class="tb-title">Simple<span>Pass</span></span>
+      <span class="tb-spacer"></span>
+      <span class="tb-sub">Jawad-Desktop · 3 nearby</span>
+    </div>
+    <div class="body">
+      <section class="devices">
+        <div class="head">
+          <h1>Nearby Computers</h1>
+          <button class="iconbtn">⚙</button>
+        </div>
+        <p class="sub">Drop a file or link onto a computer to send it · <span class="pill">3 online</span></p>
+        <div class="grid">
+          <article class="tile sel">
+            <div class="menu">🗑</div>
+            <div class="ava">💻</div>
+            <h3>Studio-Mac</h3><p>macOS · 192.168.1.21</p>
+            <span class="stat">online · paired</span>
+            <div class="act"><button class="btn prim">💬 Chat</button></div>
+          </article>
+          <article class="tile">
+            <div class="menu">⋯</div>
+            <div class="ava">🖥</div>
+            <h3>Office-PC</h3><p>Windows 11 · 192.168.1.44</p>
+            <span class="stat">online</span>
+            <div class="act"><button class="btn ghost">＋ Pair</button></div>
+          </article>
+          <article class="tile">
+            <div class="menu">⋯</div>
+            <div class="ava">🐧</div>
+            <h3>Linux-Rig</h3><p>Ubuntu · 192.168.1.9</p>
+            <span class="stat">online</span>
+            <div class="act"><button class="btn pend">✓ Pending…</button></div>
+          </article>
+          <article class="tile">
+            <div class="menu">🗑</div>
+            <div class="ava off">💻</div>
+            <h3>Bedroom-Laptop</h3><p>Windows · seen 2h ago</p>
+            <span class="stat off">offline · paired</span>
+            <div class="act"><button class="btn ghost">💬 Chat</button></div>
+          </article>
+        </div>
+      </section>
+      <aside class="chat">
+        <div class="ch-head"><h2>Studio-Mac</h2><span>● online</span></div>
+        <div class="msgs">
+          <div class="msg recv">Sending the design files now 🎨</div>
+          <div class="msg sent">Perfect, drop them on the card</div>
+          <div class="msg recv">Sent! And the link:</div>
+          <div class="msg recv">https://figma.com/file/warm</div>
+          <div class="msg sent">Love it ☕</div>
+        </div>
+        <form class="composer" onsubmit="return false">
+          <input placeholder="Message Studio-Mac" /><button class="send">Send</button>
+        </form>
+      </aside>
+      <div class="dock">
+        <div class="xfer">
+          <div class="xline"><span>Studio-Mac · warm-mockups.zip</span><small>54% · sending</small></div>
+          <div class="bar"><i style="width:54%"></i></div>
+        </div>
+        <div class="xfer">
+          <div class="xline"><span>Office-PC · figma link</span><small>complete</small></div>
+          <div class="bar"><i style="width:100%"></i></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SimplePass — Terminal Mono</title>
+<style>
+  :root {
+    --bg:#0b0f0c; --panel:#0f150f; --panel2:#121a12; --line:#1f2a1f;
+    --grn:#5ef08a; --grn-dim:#3a7a4f; --txt:#c8e6cf; --txt-dim:#6f8a76;
+    --amber:#e8c35a; --red:#ef6b6b; --cyan:#5ad4e0;
+    font-family:"JetBrains Mono","SF Mono",ui-monospace,"Consolas",monospace;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { min-height:100vh; display:grid; place-items:center; background:#060806; padding:28px; color:var(--txt); }
+  .window {
+    width:1120px; max-width:100%; height:760px; overflow:hidden;
+    border:1px solid var(--grn-dim); background:var(--bg);
+    box-shadow:0 0 0 1px #000, 0 30px 80px rgba(0,0,0,0.7), 0 0 60px rgba(94,240,138,0.06);
+    display:grid; grid-template-rows:34px 1fr;
+  }
+  .titlebar { display:flex; align-items:center; gap:10px; padding:0 12px; background:var(--panel); border-bottom:1px solid var(--line); -webkit-app-region:drag; }
+  .dot3 { display:flex; gap:7px; }
+  .dot3 i { width:11px; height:11px; border-radius:50%; border:1px solid; }
+  .dot3 .c{border-color:var(--red);} .dot3 .m{border-color:var(--amber);} .dot3 .x{border-color:var(--grn);}
+  .tb-title { font-size:12px; color:var(--grn); } .tb-title b{color:var(--txt-dim);}
+  .tb-spacer{flex:1;} .blink{ color:var(--grn); animation:bl 1.1s steps(1) infinite; } @keyframes bl{50%{opacity:0;}}
+  .tb-stat { font-size:11px; color:var(--txt-dim); }
+
+  .body { display:grid; grid-template-columns:1.5fr 1fr; min-height:0;
+    background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);
+    background-size:100% 100%, 100% 100%; }
+  .devices { padding:18px 20px; overflow:auto; border-right:1px solid var(--line); }
+  .prompt { font-size:12.5px; color:var(--txt-dim); margin-bottom:4px; }
+  .prompt b { color:var(--grn); }
+  .head { display:flex; justify-content:space-between; align-items:baseline; margin:2px 0 16px; }
+  .head h1 { font-size:15px; color:var(--grn); font-weight:700; letter-spacing:.5px; }
+  .head h1::before{content:"> ";} .head .n { font-size:11px; color:var(--amber); }
+
+  .row { border:1px solid var(--line); background:var(--panel); margin-bottom:10px; padding:13px 15px; display:grid; grid-template-columns:1fr auto; gap:6px 14px; align-items:center; }
+  .row.sel { border-color:var(--grn); box-shadow:inset 0 0 0 1px var(--grn-dim); background:var(--panel2); }
+  .nm { font-size:14px; color:var(--txt); } .nm .tag{ color:var(--grn-dim); }
+  .meta { font-size:11px; color:var(--txt-dim); grid-column:1; }
+  .meta .on { color:var(--grn); } .meta .off{ color:var(--txt-dim); } .meta .pend{ color:var(--amber); }
+  .act { grid-row:1 / span 2; align-self:center; }
+  .btn { font-family:inherit; font-size:11.5px; padding:7px 14px; border:1px solid var(--grn-dim); background:transparent; color:var(--grn); letter-spacing:.5px; }
+  .btn:hover { background:var(--grn); color:#06140b; }
+  .btn.prim { background:var(--grn); color:#06140b; border-color:var(--grn); }
+  .btn.pend { border-color:var(--amber); color:var(--amber); } .btn.pend:hover{ background:var(--amber); color:#1a1405; }
+  .btn.dim { border-color:var(--line); color:var(--txt-dim); }
+
+  .chat { background:var(--panel); display:flex; flex-direction:column; min-height:0; }
+  .ch-head { padding:14px 16px; border-bottom:1px solid var(--line); font-size:13px; color:var(--grn); }
+  .ch-head span { color:var(--txt-dim); font-size:11px; }
+  .msgs { flex:1; overflow:auto; padding:14px 16px; display:flex; flex-direction:column; gap:9px; font-size:12.5px; }
+  .msg { line-height:1.45; }
+  .msg.recv::before { content:"peer> "; color:var(--cyan); }
+  .msg.sent::before { content:"you>  "; color:var(--grn); }
+  .msg.sent { color:var(--txt); } .msg.recv{ color:var(--txt); }
+  .composer { padding:12px 14px; border-top:1px solid var(--line); display:flex; gap:0; align-items:center; }
+  .composer .ps { color:var(--grn); margin-right:8px; font-size:13px; }
+  .composer input { flex:1; background:transparent; border:0; color:var(--txt); font-family:inherit; font-size:13px; outline:none; }
+  .composer .send { font-family:inherit; border:1px solid var(--grn-dim); background:transparent; color:var(--grn); padding:6px 12px; font-size:11px; }
+
+  .dock { grid-column:1 / -1; border-top:1px solid var(--line); background:var(--panel); padding:12px 20px; display:flex; gap:18px; }
+  .xfer { flex:1; font-size:11.5px; }
+  .xline { display:flex; justify-content:space-between; color:var(--txt-dim); margin-bottom:6px; }
+  .xline b { color:var(--txt); }
+  .asciibar { color:var(--grn); letter-spacing:-1px; font-size:12px; }
+  .asciibar .e { color:var(--line); }
+</style>
+</head>
+<body>
+  <div class="window">
+    <div class="titlebar">
+      <div class="dot3"><i class="c"></i><i class="m"></i><i class="x"></i></div>
+      <span class="tb-title"><b>~/</b>simplepass <span class="blink">█</span></span>
+      <span class="tb-spacer"></span>
+      <span class="tb-stat">node: Jawad-Desktop · peers: 3</span>
+    </div>
+    <div class="body">
+      <section class="devices">
+        <div class="prompt"><b>$</b> simplepass scan --lan</div>
+        <div class="head"><h1>peers discovered</h1><span class="n">[3 online / 4 total]</span></div>
+
+        <div class="row sel">
+          <div class="nm">Studio-Mac <span class="tag">#paired</span></div>
+          <div class="meta">macos · 192.168.1.21:7420 · <span class="on">● online</span></div>
+          <div class="act"><button class="btn prim">[chat]</button></div>
+        </div>
+        <div class="row">
+          <div class="nm">Office-PC</div>
+          <div class="meta">win11 · 192.168.1.44:7420 · <span class="on">● online</span></div>
+          <div class="act"><button class="btn">[pair]</button></div>
+        </div>
+        <div class="row">
+          <div class="nm">Linux-Rig</div>
+          <div class="meta">ubuntu · 192.168.1.9:7420 · <span class="pend">◐ handshake</span></div>
+          <div class="act"><button class="btn pend">[pending]</button></div>
+        </div>
+        <div class="row">
+          <div class="nm">Bedroom-Laptop <span class="tag">#paired</span></div>
+          <div class="meta">win10 · last_seen=2h · <span class="off">○ offline</span></div>
+          <div class="act"><button class="btn dim">[chat]</button></div>
+        </div>
+      </section>
+      <aside class="chat">
+        <div class="ch-head">Studio-Mac <span>// online · e2e</span></div>
+        <div class="msgs">
+          <div class="msg recv">sending the design files now</div>
+          <div class="msg sent">drop them on the peer row</div>
+          <div class="msg recv">done. link below</div>
+          <div class="msg recv">https://figma.com/file/term</div>
+          <div class="msg sent">ack, opening</div>
+        </div>
+        <form class="composer" onsubmit="return false">
+          <span class="ps">&gt;</span><input placeholder="type message…" /><button class="send">SEND</button>
+        </form>
+      </aside>
+      <div class="dock">
+        <div class="xfer">
+          <div class="xline"><b>Studio-Mac : term-mockups.zip</b><span>61% sending</span></div>
+          <div class="asciibar">[████████████<span class="e">░░░░░░░</span>] 61%</div>
+        </div>
+        <div class="xfer">
+          <div class="xline"><b>Office-PC : figma.link</b><span>done</span></div>
+          <div class="asciibar">[███████████████████] 100%</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

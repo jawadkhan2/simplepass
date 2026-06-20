@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SimplePass — Aurora Glass</title>
+<style>
+  :root {
+    --bg-0: #0a0e1a;
+    --bg-1: #111a2e;
+    --glass: rgba(255, 255, 255, 0.06);
+    --glass-strong: rgba(255, 255, 255, 0.1);
+    --stroke: rgba(255, 255, 255, 0.12);
+    --txt: #e8eef7;
+    --txt-dim: #8a97b0;
+    --teal: #2de2c6;
+    --violet: #9b6bff;
+    --grad: linear-gradient(120deg, #2de2c6, #6b8bff 55%, #9b6bff);
+    font-family: "Inter", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    background:
+      radial-gradient(900px 600px at 12% -5%, rgba(45,226,198,0.16), transparent 60%),
+      radial-gradient(900px 700px at 110% 110%, rgba(155,107,255,0.18), transparent 55%),
+      var(--bg-0);
+    color: var(--txt);
+    padding: 28px;
+  }
+  /* window frame */
+  .window {
+    width: 1120px; max-width: 100%; height: 760px;
+    border-radius: 18px; overflow: hidden;
+    border: 1px solid var(--stroke);
+    background: linear-gradient(180deg, rgba(17,26,46,0.92), rgba(10,14,26,0.95));
+    box-shadow: 0 40px 120px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.06);
+    display: grid; grid-template-rows: 44px 1fr;
+    backdrop-filter: blur(30px);
+  }
+  /* titlebar */
+  .titlebar {
+    display: flex; align-items: center; gap: 14px;
+    padding: 0 14px;
+    border-bottom: 1px solid var(--stroke);
+    background: rgba(255,255,255,0.02);
+    -webkit-app-region: drag;
+  }
+  .lights { display: flex; gap: 8px; }
+  .lights i { width: 12px; height: 12px; border-radius: 50%; display: block; }
+  .lights .c { background: #ff5f57; } .lights .m { background: #febc2e; } .lights .x { background: #28c840; }
+  .tb-title { font-size: 12.5px; letter-spacing: .4px; color: var(--txt-dim); font-weight: 600; }
+  .tb-spacer { flex: 1; }
+  .tb-badge { font-size: 11px; color: var(--teal); background: rgba(45,226,198,0.1); border: 1px solid rgba(45,226,198,0.25); padding: 3px 9px; border-radius: 999px; }
+
+  .body { display: grid; grid-template-columns: 1.55fr 1fr; min-height: 0; }
+  .col { min-height: 0; display: flex; flex-direction: column; }
+  .devices { padding: 22px 24px; overflow: auto; }
+  .chat { border-left: 1px solid var(--stroke); background: rgba(255,255,255,0.015); }
+
+  .head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+  .head h1 { font-size: 20px; font-weight: 700; letter-spacing: -.3px; }
+  .head .sub { color: var(--txt-dim); font-size: 12.5px; margin-top: 3px; }
+  .iconbtn { width: 34px; height: 34px; border-radius: 10px; border: 1px solid var(--stroke); background: var(--glass); color: var(--txt); display: grid; place-items: center; }
+  .iconbtn:hover { background: var(--glass-strong); }
+
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .tile {
+    position: relative; border-radius: 16px; padding: 18px;
+    border: 1px solid var(--stroke); background: var(--glass);
+    backdrop-filter: blur(12px); transition: .18s;
+  }
+  .tile:hover { transform: translateY(-2px); border-color: rgba(45,226,198,0.4); }
+  .tile.sel { border-color: var(--teal); box-shadow: 0 0 0 1px var(--teal), 0 12px 40px rgba(45,226,198,0.18); }
+  .avatar { width: 52px; height: 52px; border-radius: 14px; display: grid; place-items: center; background: var(--grad); color: #07111b; margin-bottom: 12px; }
+  .avatar.off { background: rgba(255,255,255,0.08); color: var(--txt-dim); }
+  .tile h3 { font-size: 15px; font-weight: 650; }
+  .tile p { color: var(--txt-dim); font-size: 12px; margin-top: 2px; }
+  .dot { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; margin-top: 10px; color: var(--txt-dim); }
+  .dot::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #3ad17a; box-shadow: 0 0 8px #3ad17a; }
+  .dot.off::before { background: #5b6478; box-shadow: none; }
+  .tact { margin-top: 14px; }
+  .btn { width: 100%; padding: 9px; border-radius: 10px; font-size: 13px; font-weight: 600; border: 1px solid transparent; }
+  .btn.prim { background: var(--grad); color: #06121d; }
+  .btn.ghost { background: var(--glass); border-color: var(--stroke); color: var(--txt); }
+  .btn.pend { background: rgba(255,255,255,0.04); color: var(--txt-dim); }
+  .menu { position: absolute; top: 14px; right: 14px; color: var(--txt-dim); display: flex; gap: 8px; }
+
+  /* chat */
+  .chat-head { padding: 18px 20px; border-bottom: 1px solid var(--stroke); display: flex; align-items: center; justify-content: space-between; }
+  .chat-head h2 { font-size: 15px; } .chat-head .sub { color: var(--teal); font-size: 11px; }
+  .msgs { flex: 1; overflow: auto; padding: 18px 20px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 78%; padding: 10px 13px; border-radius: 14px; font-size: 13px; line-height: 1.4; }
+  .msg.recv { align-self: flex-start; background: var(--glass-strong); border: 1px solid var(--stroke); border-bottom-left-radius: 4px; }
+  .msg.sent { align-self: flex-end; background: var(--grad); color: #06121d; border-bottom-right-radius: 4px; }
+  .composer { padding: 14px 16px; border-top: 1px solid var(--stroke); display: flex; gap: 10px; }
+  .composer input { flex: 1; background: var(--glass); border: 1px solid var(--stroke); color: var(--txt); border-radius: 12px; padding: 11px 14px; outline: none; }
+  .composer input::placeholder { color: var(--txt-dim); }
+  .composer .send { padding: 0 18px; border-radius: 12px; background: var(--grad); color: #06121d; font-weight: 600; }
+
+  /* transfer dock */
+  .dock { grid-column: 1 / -1; border-top: 1px solid var(--stroke); padding: 12px 24px; display: flex; gap: 14px; background: rgba(0,0,0,0.25); }
+  .xfer { flex: 1; display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; background: var(--glass); border: 1px solid var(--stroke); border-radius: 12px; padding: 10px 14px; }
+  .xfer b { font-size: 12.5px; } .xfer small { color: var(--txt-dim); font-size: 11px; }
+  .bar { grid-column: 1 / -1; height: 5px; border-radius: 999px; background: rgba(255,255,255,0.08); overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--grad); }
+  .pct { font-size: 11px; color: var(--teal); }
+</style>
+</head>
+<body>
+  <div class="window">
+    <div class="titlebar">
+      <div class="lights"><i class="c"></i><i class="m"></i><i class="x"></i></div>
+      <span class="tb-title">SimplePass</span>
+      <span class="tb-spacer"></span>
+      <span class="tb-badge">3 online</span>
+    </div>
+    <div class="body">
+      <section class="col devices">
+        <div class="head">
+          <div>
+            <h1>Nearby Computers</h1>
+            <div class="sub">This device · Jawad-Desktop</div>
+          </div>
+          <button class="iconbtn">⚙</button>
+        </div>
+        <div class="grid">
+          <article class="tile sel">
+            <div class="menu">🗑 ⋮</div>
+            <div class="avatar">💻</div>
+            <h3>Studio-Mac</h3>
+            <p>macOS · 192.168.1.21</p>
+            <span class="dot">online</span>
+            <div class="tact"><button class="btn prim">💬 Chat</button></div>
+          </article>
+          <article class="tile">
+            <div class="menu">⋮</div>
+            <div class="avatar">💻</div>
+            <h3>Office-PC</h3>
+            <p>Windows · 192.168.1.44</p>
+            <span class="dot">online</span>
+            <div class="tact"><button class="btn ghost">＋ Pair</button></div>
+          </article>
+          <article class="tile">
+            <div class="menu">⋮</div>
+            <div class="avatar">💻</div>
+            <h3>Linux-Rig</h3>
+            <p>Ubuntu · 192.168.1.9</p>
+            <span class="dot">online</span>
+            <div class="tact"><button class="btn pend">✓ Pending…</button></div>
+          </article>
+          <article class="tile">
+            <div class="menu">🗑 ⋮</div>
+            <div class="avatar off">💻</div>
+            <h3>Bedroom-Laptop</h3>
+            <p>Windows · offline</p>
+            <span class="dot off">offline</span>
+            <div class="tact"><button class="btn ghost">💬 Chat</button></div>
+          </article>
+        </div>
+      </section>
+      <aside class="col chat">
+        <div class="chat-head">
+          <div><h2>Studio-Mac</h2><div class="sub">online</div></div>
+          <button class="iconbtn">✕</button>
+        </div>
+        <div class="msgs">
+          <div class="msg recv">Sending over the design files now 👍</div>
+          <div class="msg sent">Got it — drop them on the tile</div>
+          <div class="msg recv">Done. Also here's the link</div>
+          <div class="msg recv">https://figma.com/file/aurora</div>
+          <div class="msg sent">Opening it 🚀</div>
+        </div>
+        <form class="composer" onsubmit="return false">
+          <input placeholder="Message Studio-Mac" />
+          <button class="send">Send</button>
+        </form>
+      </aside>
+      <div class="dock">
+        <div class="xfer">
+          <b>Studio-Mac</b><span class="pct">68%</span>
+          <small>aurora-mockups.zip</small><small>sending</small>
+          <div class="bar"><i style="width:68%"></i></div>
+        </div>
+        <div class="xfer">
+          <b>Office-PC</b><span class="pct">100%</span>
+          <small>figma link</small><small>complete</small>
+          <div class="bar"><i style="width:100%"></i></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

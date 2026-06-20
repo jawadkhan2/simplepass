@@ -8,18 +8,18 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State,
+    AppHandle, Emitter, Manager, State, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_notification::NotificationExt;
@@ -31,7 +31,6 @@ const DISCOVERY_PORT: u16 = 45937;
 const TRANSPORT_PORT: u16 = 45938;
 const DISCOVERY_MAGIC: &str = "simplepass:v1";
 const PEER_OFFLINE_AFTER_MS: i64 = 9_000;
-const FILE_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +41,8 @@ struct SetupState {
     identity_secret: String,
     device_name: String,
     start_at_login: bool,
+    #[serde(default)]
+    avatar: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +52,7 @@ struct SetupResponse {
     device_id: String,
     device_name: String,
     start_at_login: bool,
+    avatar: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +69,8 @@ struct PeerDevice {
     trust_state: String,
     #[serde(default)]
     shared_secret: Option<String>,
+    #[serde(default)]
+    avatar: Option<String>,
     last_seen: i64,
 }
 
@@ -78,6 +82,44 @@ struct ChatMessage {
     direction: String,
     text: String,
     created_at: i64,
+    #[serde(default = "default_message_kind")]
+    kind: String,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    file_size: Option<u64>,
+    #[serde(default)]
+    file_path: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+}
+
+fn default_message_kind() -> String {
+    "text".to_string()
+}
+
+fn make_chat_message(peer_id: String, direction: &str, kind: &str, text: String) -> ChatMessage {
+    ChatMessage {
+        id: Uuid::new_v4().to_string(),
+        peer_id,
+        direction: direction.to_string(),
+        text,
+        created_at: now_ms(),
+        kind: kind.to_string(),
+        file_name: None,
+        file_size: None,
+        file_path: None,
+        url: None,
+    }
+}
+
+fn record_chat_message(app: &AppHandle, state: &State<AppState>, message: ChatMessage) -> AppResult<()> {
+    {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        persisted.messages.push(message.clone());
+        save_state(&state.path, &persisted)?;
+    }
+    app.emit("chat-message", message).map_err(|err| err.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +153,7 @@ impl Default for PersistedState {
                 identity_secret: new_identity_secret(),
                 device_name: String::new(),
                 start_at_login: true,
+                avatar: None,
             },
             peers: Vec::new(),
             messages: Vec::new(),
@@ -140,6 +183,8 @@ enum WireMessage {
     FileStart { peer_id: String, transfer_id: String, file_name: String, total_size: u64 },
     FileChunk { peer_id: String, transfer_id: String, data: String },
     FileEnd { peer_id: String, transfer_id: String },
+    Typing { peer_id: String, is_typing: bool },
+    Profile { peer_id: String, avatar: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +198,27 @@ struct AppState {
     path: PathBuf,
     inner: Mutex<PersistedState>,
     incoming_files: Mutex<HashMap<String, IncomingFile>>,
+    outgoing_files: Mutex<HashMap<String, Arc<Mutex<OutgoingSession>>>>,
+}
+
+/// One open TCP connection to a target peer for an in-flight outgoing file.
+struct PeerConn {
+    peer_id: String,
+    peer_name: String,
+    stream: TcpStream,
+    secret: String,
+    failed: bool,
+}
+
+/// A file send driven incrementally by the frontend (begin → chunk* → finish).
+/// Holds the open connections so chunks stream in order without re-reading from disk.
+struct OutgoingSession {
+    transfer_id: String,
+    local_id: String,
+    file_name: String,
+    total: u64,
+    sent: u64,
+    conns: Vec<PeerConn>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +253,7 @@ fn save_setup(
         identity_secret: existing_identity_secret(&state)?,
         device_name: cleaned.to_string(),
         start_at_login,
+        avatar: state.inner.lock().map_err(lock_err)?.setup.avatar.clone(),
     };
 
     {
@@ -249,7 +316,21 @@ fn accept_pairing(app: AppHandle, state: State<AppState>, peer_id: String) -> Ap
     };
     let packet = local_discovery_packet(&state)?;
     let _ = send_plain_wire(&peer, WireMessage::PairAccepted { device: packet });
+    send_profile_to_peer(&state, &peer_id);
     app.emit("peers-changed", peers).map_err(|err| err.to_string())
+}
+
+/// Pushes our current profile (avatar) to a single paired peer. Best-effort.
+fn send_profile_to_peer(state: &State<AppState>, peer_id: &str) {
+    let (local_id, avatar) = match state.inner.lock() {
+        Ok(persisted) => (persisted.setup.device_id.clone(), persisted.setup.avatar.clone()),
+        Err(_) => return,
+    };
+    if let Ok(peer) = get_peer(state, peer_id) {
+        if peer.trust_state == "paired" {
+            let _ = send_wire(&peer, WireMessage::Profile { peer_id: local_id, avatar });
+        }
+    }
 }
 
 #[tauri::command]
@@ -298,52 +379,39 @@ fn send_message(app: AppHandle, state: State<AppState>, peer_id: String, text: S
     let peer = get_peer(&state, &peer_id)?;
     let local_id = existing_device_id(&state)?;
     send_wire(&peer, WireMessage::Chat { peer_id: local_id, text: text.clone() })?;
-    let message = ChatMessage {
-        id: Uuid::new_v4().to_string(),
-        peer_id,
-        direction: "sent".to_string(),
-        text,
-        created_at: now_ms(),
-    };
-
-    {
-        let mut persisted = state.inner.lock().map_err(lock_err)?;
-        persisted.messages.push(message.clone());
-        save_state(&state.path, &persisted)?;
-    }
-
-    app.emit("chat-message", message).map_err(|err| err.to_string())
+    let message = make_chat_message(peer_id, "sent", "text", text);
+    record_chat_message(&app, &state, message)
 }
 
 #[tauri::command]
 fn receive_message(app: AppHandle, state: State<AppState>, peer_id: String, text: String) -> AppResult<()> {
     ensure_paired(&state, &peer_id)?;
-    let message = ChatMessage {
-        id: Uuid::new_v4().to_string(),
-        peer_id,
-        direction: "received".to_string(),
-        text,
-        created_at: now_ms(),
-    };
+    let message = make_chat_message(peer_id, "received", "text", text);
 
-    {
-        let mut persisted = state.inner.lock().map_err(lock_err)?;
-        persisted.messages.push(message.clone());
-        save_state(&state.path, &persisted)?;
+    // Only toast when the window is hidden (minimized to the tray). If it's open,
+    // the message lands in the chat in view — no notification needed.
+    let window_hidden = app
+        .get_webview_window("main")
+        .and_then(|window| window.is_visible().ok())
+        .map(|visible| !visible)
+        .unwrap_or(true);
+    if window_hidden {
+        let _ = app
+            .notification()
+            .builder()
+            .title("SimplePass")
+            .body("New chat message")
+            .show();
     }
-
-    let _ = app
-        .notification()
-        .builder()
-        .title("SimplePass")
-        .body("New chat message")
-        .show();
-    app.emit("chat-message", message).map_err(|err| err.to_string())
+    record_chat_message(&app, &state, message)
 }
 
 #[tauri::command]
-fn receive_link(state: State<AppState>, peer_id: String, url: String) -> AppResult<()> {
+fn receive_link(app: AppHandle, state: State<AppState>, peer_id: String, url: String) -> AppResult<()> {
     ensure_paired(&state, &peer_id)?;
+    let mut message = make_chat_message(peer_id, "received", "link", url.clone());
+    message.url = Some(url.clone());
+    record_chat_message(&app, &state, message)?;
     open_url(&url)
 }
 
@@ -373,6 +441,9 @@ fn send_link(
                 transfer.progress = 100;
                 transfer.state = "complete".to_string();
                 transfer.error = None;
+                let mut message = make_chat_message(transfer.peer_id.clone(), "sent", "link", url.clone());
+                message.url = Some(url.clone());
+                let _ = record_chat_message(&app, &state, message);
             }
             Err(err) => {
                 transfer.state = "failed".to_string();
@@ -391,83 +462,279 @@ fn send_link(
     Ok(transfers)
 }
 
+fn transfer_row_id(transfer_id: &str, peer_id: &str) -> String {
+    format!("{transfer_id}:{peer_id}")
+}
+
+/// Opens a connection to every paired target, sends `FileStart`, and stores the
+/// streaming session. The frontend then drives `send_file_chunk`/`finish_file_send`.
 #[tauri::command]
-fn send_files(
+fn begin_file_send(
     app: AppHandle,
     state: State<AppState>,
     peer_ids: Vec<String>,
-    paths: Vec<String>,
-) -> AppResult<Vec<TransferProgress>> {
-    if peer_ids.is_empty() || paths.is_empty() {
-        return Ok(Vec::new());
+    file_name: String,
+    total_size: u64,
+) -> AppResult<String> {
+    if peer_ids.is_empty() {
+        return Err("No target devices.".to_string());
+    }
+    let local_id = existing_device_id(&state)?;
+    let transfer_id = Uuid::new_v4().to_string();
+    let mut conns = Vec::new();
+
+    for peer_id in &peer_ids {
+        let peer = get_peer(&state, peer_id)?;
+        if peer.trust_state != "paired" {
+            return Err(format!("{} is not paired.", peer.name));
+        }
+        if peer.host.trim().is_empty() {
+            return Err(format!("{} does not have a network address yet.", peer.name));
+        }
+        let secret = peer
+            .shared_secret
+            .clone()
+            .ok_or_else(|| format!("{} does not have a shared secret yet.", peer.name))?;
+        let mut stream =
+            TcpStream::connect((peer.host.as_str(), peer.port)).map_err(|err| err.to_string())?;
+        write_encrypted_line(
+            &mut stream,
+            &local_id,
+            &secret,
+            &WireMessage::FileStart {
+                peer_id: local_id.clone(),
+                transfer_id: transfer_id.clone(),
+                file_name: file_name.clone(),
+                total_size,
+            },
+        )?;
+        emit_transfer(
+            &app,
+            TransferProgress {
+                id: transfer_row_id(&transfer_id, &peer.id),
+                peer_id: peer.id.clone(),
+                peer_name: peer.name.clone(),
+                label: file_name.clone(),
+                kind: "file".to_string(),
+                progress: 0,
+                state: "sending".to_string(),
+                error: None,
+            },
+        )?;
+        conns.push(PeerConn {
+            peer_id: peer.id.clone(),
+            peer_name: peer.name.clone(),
+            stream,
+            secret,
+            failed: false,
+        });
     }
 
-    let labels = paths
-        .iter()
-        .map(|path| Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or(path))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let transfers = make_transfers(&state, &peer_ids, &labels, "file")?;
-    let mut transfers = transfers
-        .into_iter()
-        .map(|mut transfer| {
-            transfer.progress = 0;
-            transfer.state = "queued".to_string();
-            transfer
-        })
-        .collect::<Vec<_>>();
-    let local_id = existing_device_id(&state)?;
-    for transfer in &mut transfers {
-        emit_transfer(&app, transfer.clone())?;
-        let peer = get_peer(&state, &transfer.peer_id)?;
-        transfer.state = "sending".to_string();
-        let total_bytes = paths
-            .iter()
-            .map(|path| fs::metadata(path).map(|metadata| metadata.len()).map_err(|err| err.to_string()))
-            .collect::<AppResult<Vec<_>>>()?
-            .into_iter()
-            .sum::<u64>()
-            .max(1);
-        let mut sent_bytes = 0_u64;
+    let session = OutgoingSession {
+        transfer_id: transfer_id.clone(),
+        local_id,
+        file_name,
+        total: total_size.max(1),
+        sent: 0,
+        conns,
+    };
+    state
+        .outgoing_files
+        .lock()
+        .map_err(lock_err)?
+        .insert(transfer_id.clone(), Arc::new(Mutex::new(session)));
+    Ok(transfer_id)
+}
 
-        for path in &paths {
-            let source = Path::new(path);
-            let file_name = source
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| "File path has no filename.".to_string())?
-                .to_string();
-            let transfer_id = Uuid::new_v4().to_string();
-            match send_file_to_peer(&peer, &local_id, &transfer_id, source, &file_name, total_bytes, &mut sent_bytes, |progress| {
-                transfer.progress = progress;
-                emit_transfer(&app, transfer.clone())
-            }) {
-                Ok(()) => {
-                    transfer.progress = ((sent_bytes as f64 / total_bytes as f64) * 100.0).round() as u8;
-                    emit_transfer(&app, transfer.clone())?;
-                }
-                Err(err) => {
-                    transfer.state = "failed".to_string();
-                    transfer.error = Some(err);
-                    emit_transfer(&app, transfer.clone())?;
-                    break;
-                }
+/// Forwards one base64 chunk (already encoded by the frontend) to each target.
+#[tauri::command]
+fn send_file_chunk(
+    app: AppHandle,
+    state: State<AppState>,
+    session_id: String,
+    data: String,
+    byte_len: u64,
+) -> AppResult<()> {
+    let session = state
+        .outgoing_files
+        .lock()
+        .map_err(lock_err)?
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| "Unknown transfer session.".to_string())?;
+    let mut session = session.lock().map_err(lock_err)?;
+    session.sent += byte_len;
+    let progress = (((session.sent as f64) / (session.total.max(1) as f64)) * 100.0)
+        .round()
+        .min(100.0) as u8;
+    let local_id = session.local_id.clone();
+    let transfer_id = session.transfer_id.clone();
+    let file_name = session.file_name.clone();
+
+    for conn in session.conns.iter_mut() {
+        if conn.failed {
+            continue;
+        }
+        let result = write_encrypted_line(
+            &mut conn.stream,
+            &local_id,
+            &conn.secret,
+            &WireMessage::FileChunk {
+                peer_id: local_id.clone(),
+                transfer_id: transfer_id.clone(),
+                data: data.clone(),
+            },
+        );
+        match result {
+            Ok(()) => emit_transfer(
+                &app,
+                TransferProgress {
+                    id: transfer_row_id(&transfer_id, &conn.peer_id),
+                    peer_id: conn.peer_id.clone(),
+                    peer_name: conn.peer_name.clone(),
+                    label: file_name.clone(),
+                    kind: "file".to_string(),
+                    progress,
+                    state: "sending".to_string(),
+                    error: None,
+                },
+            )?,
+            Err(err) => {
+                conn.failed = true;
+                emit_transfer(
+                    &app,
+                    TransferProgress {
+                        id: transfer_row_id(&transfer_id, &conn.peer_id),
+                        peer_id: conn.peer_id.clone(),
+                        peer_name: conn.peer_name.clone(),
+                        label: file_name.clone(),
+                        kind: "file".to_string(),
+                        progress,
+                        state: "failed".to_string(),
+                        error: Some(err),
+                    },
+                )?;
             }
         }
-        if transfer.state != "failed" {
-            transfer.progress = 100;
-            transfer.state = "complete".to_string();
-            emit_transfer(&app, transfer.clone())?;
+    }
+    Ok(())
+}
+
+/// Sends `FileEnd`, tears down the session, records a chat message per target.
+#[tauri::command]
+fn finish_file_send(app: AppHandle, state: State<AppState>, session_id: String) -> AppResult<()> {
+    let session = state
+        .outgoing_files
+        .lock()
+        .map_err(lock_err)?
+        .remove(&session_id);
+    let session = session.ok_or_else(|| "Unknown transfer session.".to_string())?;
+    let mut session = session.lock().map_err(lock_err)?;
+    let local_id = session.local_id.clone();
+    let transfer_id = session.transfer_id.clone();
+    let file_name = session.file_name.clone();
+    let total = session.total;
+
+    for conn in session.conns.iter_mut() {
+        if conn.failed {
+            continue;
+        }
+        let _ = write_encrypted_line(
+            &mut conn.stream,
+            &local_id,
+            &conn.secret,
+            &WireMessage::FileEnd {
+                peer_id: local_id.clone(),
+                transfer_id: transfer_id.clone(),
+            },
+        );
+        let _ = conn.stream.flush();
+    }
+
+    for conn in &session.conns {
+        let row = TransferProgress {
+            id: transfer_row_id(&transfer_id, &conn.peer_id),
+            peer_id: conn.peer_id.clone(),
+            peer_name: conn.peer_name.clone(),
+            label: file_name.clone(),
+            kind: "file".to_string(),
+            progress: 100,
+            state: if conn.failed { "failed" } else { "complete" }.to_string(),
+            error: None,
+        };
+        {
+            let mut persisted = state.inner.lock().map_err(lock_err)?;
+            persisted.transfers.push(row.clone());
+            save_state(&state.path, &persisted)?;
+        }
+        emit_transfer(&app, row)?;
+        if !conn.failed {
+            let mut message = make_chat_message(conn.peer_id.clone(), "sent", "file", file_name.clone());
+            message.file_name = Some(file_name.clone());
+            message.file_size = Some(total);
+            let _ = record_chat_message(&app, &state, message);
         }
     }
+    Ok(())
+}
 
-    {
-        let mut persisted = state.inner.lock().map_err(lock_err)?;
-        persisted.transfers.extend(transfers.clone());
-        save_state(&state.path, &persisted)?;
+#[tauri::command]
+fn send_typing(state: State<AppState>, peer_id: String, is_typing: bool) -> AppResult<()> {
+    let local_id = existing_device_id(&state)?;
+    if let Ok(peer) = get_peer(&state, &peer_id) {
+        if peer.trust_state == "paired" {
+            let _ = send_wire(&peer, WireMessage::Typing { peer_id: local_id, is_typing });
+        }
     }
+    Ok(())
+}
 
-    Ok(transfers)
+#[tauri::command]
+fn clear_messages(state: State<AppState>) -> AppResult<()> {
+    let mut persisted = state.inner.lock().map_err(lock_err)?;
+    persisted.messages.clear();
+    save_state(&state.path, &persisted)
+}
+
+#[tauri::command]
+fn clear_transfers(state: State<AppState>) -> AppResult<()> {
+    let mut persisted = state.inner.lock().map_err(lock_err)?;
+    persisted.transfers.clear();
+    save_state(&state.path, &persisted)
+}
+
+#[tauri::command]
+fn open_path(path: String) -> AppResult<()> {
+    open::that(path).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_avatar(app: AppHandle, state: State<AppState>, avatar: Option<String>) -> AppResult<SetupResponse> {
+    let (response, paired) = {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        persisted.setup.avatar = avatar;
+        save_state(&state.path, &persisted)?;
+        let response = setup_response(&persisted.setup);
+        let paired = persisted
+            .peers
+            .iter()
+            .filter(|peer| peer.trust_state == "paired")
+            .cloned()
+            .collect::<Vec<_>>();
+        (response, paired)
+    };
+    let local_id = response.device_id.clone();
+    for peer in paired {
+        let _ = send_wire(
+            &peer,
+            WireMessage::Profile {
+                peer_id: local_id.clone(),
+                avatar: response.avatar.clone(),
+            },
+        );
+    }
+    let _ = app.emit("setup-changed", response.clone());
+    Ok(response)
 }
 
 pub fn run() {
@@ -488,10 +755,18 @@ pub fn run() {
                 path,
                 inner: Mutex::new(persisted),
                 incoming_files: Mutex::new(HashMap::new()),
+                outgoing_files: Mutex::new(HashMap::new()),
             });
             build_tray(app.handle())?;
             start_transport(app.handle().clone());
             Ok(())
+        })
+        // Keep the app alive in the tray: closing the window hides it instead of quitting.
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_setup_state,
@@ -506,7 +781,14 @@ pub fn run() {
             receive_message,
             receive_link,
             send_link,
-            send_files
+            begin_file_send,
+            send_file_chunk,
+            finish_file_send,
+            send_typing,
+            clear_messages,
+            clear_transfers,
+            set_avatar,
+            open_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running SimplePass");
@@ -567,17 +849,38 @@ fn handle_message(
             app.emit("pairing-request", peer).map_err(|err| err.to_string())?;
         }
         WireMessage::PairAccepted { device } => {
+            let device_id = device.device_id.clone();
             let shared_secret = {
                 let persisted = state.inner.lock().map_err(lock_err)?;
                 derive_shared_secret(&persisted.setup.identity_secret, &device.public_key)?
             };
             upsert_discovered_peer(app, state, device, "paired", remote_addr, Some(shared_secret))?;
+            send_profile_to_peer(state, &device_id);
         }
         WireMessage::Chat { peer_id, text } => {
             receive_message(app.clone(), state.clone(), peer_id, text)?;
         }
         WireMessage::Link { peer_id, url } => {
-            receive_link(state.clone(), peer_id, url)?;
+            receive_link(app.clone(), state.clone(), peer_id, url)?;
+        }
+        WireMessage::Typing { peer_id, is_typing } => {
+            app.emit(
+                "peer-typing",
+                serde_json::json!({ "peerId": peer_id, "isTyping": is_typing }),
+            )
+            .map_err(|err| err.to_string())?;
+        }
+        WireMessage::Profile { peer_id, avatar } => {
+            let peers = {
+                let mut persisted = state.inner.lock().map_err(lock_err)?;
+                if let Some(peer) = persisted.peers.iter_mut().find(|peer| peer.id == peer_id) {
+                    peer.avatar = avatar;
+                }
+                let peers = persisted.peers.clone();
+                save_state(&state.path, &persisted)?;
+                peers
+            };
+            app.emit("peers-changed", peers).map_err(|err| err.to_string())?;
         }
         WireMessage::FileStart {
             peer_id,
@@ -680,6 +983,7 @@ fn upsert_peer_from_addr(
                 status: "online".to_string(),
                 trust_state: "unpaired".to_string(),
                 shared_secret: None,
+                avatar: None,
                 last_seen: now_ms(),
             }),
         }
@@ -759,6 +1063,7 @@ fn upsert_discovered_peer(
                     status: "online".to_string(),
                     trust_state: trust_state.to_string(),
                     shared_secret,
+                    avatar: None,
                     last_seen: now_ms(),
                 };
                 persisted.peers.push(peer);
@@ -809,81 +1114,6 @@ fn write_encrypted_line(
     stream.write_all(b"\n").map_err(|err| err.to_string())
 }
 
-/// Streams a single file to a peer over one TCP connection as `FileStart`,
-/// repeated `FileChunk`s, then `FileEnd`. Keeping the whole file on one
-/// connection guarantees the receiver processes the chunks in order.
-fn send_file_to_peer<F>(
-    peer: &PeerDevice,
-    local_id: &str,
-    transfer_id: &str,
-    source: &Path,
-    file_name: &str,
-    total_bytes: u64,
-    sent_bytes: &mut u64,
-    mut on_progress: F,
-) -> AppResult<()>
-where
-    F: FnMut(u8) -> AppResult<()>,
-{
-    if peer.host.trim().is_empty() {
-        return Err(format!("{} does not have a network address yet.", peer.name));
-    }
-    let secret = peer
-        .shared_secret
-        .as_deref()
-        .ok_or_else(|| format!("{} does not have a shared secret yet.", peer.name))?;
-    let file_size = fs::metadata(source).map_err(|err| err.to_string())?.len();
-    let file = fs::File::open(source).map_err(|err| err.to_string())?;
-    let mut reader = BufReader::new(file);
-    let mut stream = TcpStream::connect((peer.host.as_str(), peer.port)).map_err(|err| err.to_string())?;
-
-    write_encrypted_line(
-        &mut stream,
-        local_id,
-        secret,
-        &WireMessage::FileStart {
-            peer_id: local_id.to_string(),
-            transfer_id: transfer_id.to_string(),
-            file_name: file_name.to_string(),
-            total_size: file_size,
-        },
-    )?;
-
-    let mut buffer = vec![0_u8; FILE_CHUNK_SIZE];
-    loop {
-        let read = reader.read(&mut buffer).map_err(|err| err.to_string())?;
-        if read == 0 {
-            break;
-        }
-        write_encrypted_line(
-            &mut stream,
-            local_id,
-            secret,
-            &WireMessage::FileChunk {
-                peer_id: local_id.to_string(),
-                transfer_id: transfer_id.to_string(),
-                data: BASE64.encode(&buffer[..read]),
-            },
-        )?;
-        *sent_bytes += read as u64;
-        let progress = (((*sent_bytes as f64) / (total_bytes.max(1) as f64)) * 100.0)
-            .round()
-            .min(100.0) as u8;
-        on_progress(progress)?;
-    }
-
-    write_encrypted_line(
-        &mut stream,
-        local_id,
-        secret,
-        &WireMessage::FileEnd {
-            peer_id: local_id.to_string(),
-            transfer_id: transfer_id.to_string(),
-        },
-    )?;
-    stream.flush().map_err(|err| err.to_string())
-}
-
 fn encrypt_message(peer_id: &str, secret: &str, message: &WireMessage) -> AppResult<TransportEnvelope> {
     let key = decode_secret(secret)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|err| err.to_string())?;
@@ -906,7 +1136,9 @@ fn envelope_peer_id(message: &WireMessage) -> AppResult<&str> {
         | WireMessage::Link { peer_id, .. }
         | WireMessage::FileStart { peer_id, .. }
         | WireMessage::FileChunk { peer_id, .. }
-        | WireMessage::FileEnd { peer_id, .. } => Ok(peer_id),
+        | WireMessage::FileEnd { peer_id, .. }
+        | WireMessage::Typing { peer_id, .. }
+        | WireMessage::Profile { peer_id, .. } => Ok(peer_id),
         WireMessage::PairRequest { .. } | WireMessage::PairAccepted { .. } => {
             Err("Pairing messages must be sent without encryption.".to_string())
         }
@@ -919,6 +1151,7 @@ fn setup_response(setup: &SetupState) -> SetupResponse {
         device_id: setup.device_id.clone(),
         device_name: setup.device_name.clone(),
         start_at_login: setup.start_at_login,
+        avatar: setup.avatar.clone(),
     }
 }
 
@@ -1087,7 +1320,12 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
 
-    TrayIconBuilder::new()
+    let mut builder = TrayIconBuilder::new();
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+
+    builder
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -1265,6 +1503,27 @@ fn receive_file_end(
     let entry = entry.ok_or_else(|| "Received an end marker for an unknown transfer.".to_string())?;
     open::that(&entry.path).map_err(|err| err.to_string())?;
 
+    let mut message = make_chat_message(peer_id.clone(), "received", "file", entry.file_name.clone());
+    message.file_name = Some(entry.file_name.clone());
+    message.file_size = Some(entry.expected_size);
+    message.file_path = Some(entry.path.to_string_lossy().to_string());
+    record_chat_message(app, state, message)?;
+
+    {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        persisted.transfers.push(TransferProgress {
+            id: transfer_id.clone(),
+            peer_id: peer_id.clone(),
+            peer_name: entry.peer_name.clone(),
+            label: entry.file_name.clone(),
+            kind: "file".to_string(),
+            progress: 100,
+            state: "complete".to_string(),
+            error: None,
+        });
+        save_state(&state.path, &persisted)?;
+    }
+
     emit_transfer(
         app,
         TransferProgress {
@@ -1429,6 +1688,7 @@ mod tests {
             status: "online".to_string(),
             trust_state: "paired".to_string(),
             shared_secret: Some(new_shared_secret()),
+            avatar: None,
             last_seen: 1_000,
         });
 
