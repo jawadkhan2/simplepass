@@ -21,7 +21,7 @@ The app is not yet code-signed, so the OS shows a one-time warning on first run:
   xattr -dr com.apple.quarantine "/Applications/SimplePass.app"
   ```
 
-After the first install, SimplePass updates itself automatically — no need to download again.
+After the first install, SimplePass checks for updates and prompts you to install them — no need to download the installer again.
 
 ## Current Features
 
@@ -37,8 +37,8 @@ After the first install, SimplePass updates itself automatically — no need to 
 - AirDrop-style nearby computer tiles.
 - Drag a URL onto one or more paired devices to open it remotely.
 - Drag files onto one or more paired devices to send them remotely using Tauri native file-drop paths.
-- Received links open in Chrome when available, otherwise in the default browser.
-- Received files save into the OS Downloads folder, auto-rename conflicts, then open with the default app.
+- Received links are recorded in chat and open on click (Chrome when available, otherwise the default browser); only http(s) links are accepted, and they are never opened automatically.
+- Received files save into the OS Downloads folder and auto-rename conflicts; open them by clicking the chat entry (received files are never auto-launched).
 - 1:1 chat with local history.
 - Toast notifications for received chat messages only.
 - Per-destination transfer progress rows.
@@ -83,9 +83,10 @@ Windows artifacts are generated at:
 
 ## Over-the-Air Updates
 
-SimplePass updates itself from GitHub Releases. It checks at launch and every 12
-hours, installs in the background, and relaunches into the new version. Users can
-also trigger a check via **Settings > Check for updates**.
+SimplePass checks GitHub Releases for updates at launch and every 12 hours. When
+one is found it surfaces a banner; the user chooses when to download, install, and
+relaunch — updates are never installed silently. A manual check is also available
+via **Settings > Check for updates**.
 
 ### One-time setup (before the first release)
 

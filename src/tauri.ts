@@ -17,13 +17,11 @@ export const api = {
   sendTyping: (peerId: string, isTyping: boolean) =>
     invoke<void>("send_typing", { peerId, isTyping }),
   sendLink: (peerIds: string[], url: string) => invoke<TransferProgress[]>("send_link", { peerIds, url }),
-  beginFileSend: (peerIds: string[], fileName: string, totalSize: number) =>
-    invoke<string>("begin_file_send", { peerIds, fileName, totalSize }),
-  sendFileChunk: (sessionId: string, data: string, byteLen: number) =>
-    invoke<void>("send_file_chunk", { sessionId, data, byteLen }),
-  finishFileSend: (sessionId: string) => invoke<void>("finish_file_send", { sessionId }),
+  sendFiles: (peerIds: string[], paths: string[]) => invoke<void>("send_files", { peerIds, paths }),
+  cancelFileSend: (transferId: string) => invoke<void>("cancel_file_send", { transferId }),
   clearMessages: () => invoke<void>("clear_messages"),
-  openPath: (path: string) => invoke<void>("open_path", { path })
+  openPath: (path: string) => invoke<void>("open_path", { path }),
+  openLink: (url: string) => invoke<void>("open_link", { url })
 };
 
 export const events = {
@@ -38,5 +36,7 @@ export const events = {
   onTyping: (handler: (signal: TypingSignal) => void) =>
     listen<TypingSignal>("peer-typing", (event) => handler(event.payload)),
   onSetupChanged: (handler: (setup: SetupState) => void) =>
-    listen<SetupState>("setup-changed", (event) => handler(event.payload))
+    listen<SetupState>("setup-changed", (event) => handler(event.payload)),
+  onTransportError: (handler: (message: string) => void) =>
+    listen<string>("transport-error", (event) => handler(event.payload))
 };

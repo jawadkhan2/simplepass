@@ -18,12 +18,13 @@ import {
 } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { api, events } from "./tauri";
-import { checkForUpdate, startAutoUpdate } from "./updater";
+import { applyPendingUpdate, checkForUpdate, startAutoUpdate } from "./updater";
 import type { ChatMessage, PeerDevice, SetupState, TransferProgress } from "./types";
 
 const TRANSFER_LIMIT = 8;
-const FILE_CHUNK_SIZE = 64 * 1024;
 const looksLikeUrl = (value: string) => /^https?:\/\/\S+$/i.test(value.trim());
 
 function AppIcon({ size = 18 }: { size?: number }) {
@@ -81,15 +82,6 @@ function WindowFrame({ children }: { children: React.ReactNode }) {
   );
 }
 
-function bufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 0x8000)));
-  }
-  return btoa(binary);
-}
-
 function formatBytes(bytes?: number | null): string {
   if (!bytes || bytes <= 0) return "";
   const units = ["B", "KB", "MB", "GB"];
@@ -140,6 +132,39 @@ function Avatar({ src, size = 34 }: { src?: string | null; size?: number }) {
   return <Laptop size={size} />;
 }
 
+// Short, human-comparable fingerprint of a base64 X25519 public key. Both devices
+// derive the same value for the same key, so the person approving a pairing can
+// read it out-of-band to confirm they're trusting the right machine — the only
+// real defence against a LAN device spoofing another's name.
+async function fingerprintOf(publicKey: string): Promise<string> {
+  const raw = Uint8Array.from(atob(publicKey), (c) => c.charCodeAt(0));
+  const digest = await crypto.subtle.digest("SHA-256", raw);
+  return Array.from(new Uint8Array(digest))
+    .slice(0, 8)
+    .map((b) => b.toString(16).padStart(2, "0").toUpperCase())
+    .join("")
+    .replace(/(.{4})(?=.)/g, "$1 ");
+}
+
+function KeyFingerprint({ publicKey }: { publicKey?: string | null }) {
+  const [fingerprint, setFingerprint] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true;
+    if (!publicKey) {
+      setFingerprint(null);
+      return;
+    }
+    void fingerprintOf(publicKey).then((value) => {
+      if (active) setFingerprint(value);
+    });
+    return () => {
+      active = false;
+    };
+  }, [publicKey]);
+  if (!fingerprint) return null;
+  return <code className="key-fingerprint">{fingerprint}</code>;
+}
+
 export default function App() {
   const [setup, setSetup] = useState<SetupState | null>(null);
   const [peers, setPeers] = useState<PeerDevice[]>([]);
@@ -151,11 +176,20 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [pairingRequest, setPairingRequest] = useState<PeerDevice | null>(null);
   const [dragPeerId, setDragPeerId] = useState<string | null>(null);
+  const [chatDragActive, setChatDragActive] = useState(false);
   const [typingPeers, setTypingPeers] = useState<Record<string, boolean>>({});
+  const [updateVersion, setUpdateVersion] = useState<string | null>(null);
 
-  const shareInputRef = useRef<HTMLInputElement | null>(null);
-  const shareTargetRef = useRef<PeerDevice | null>(null);
   const typingTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+
+  // The native drag-drop listener is set up once; it reads live selection/peer
+  // state through refs to avoid a stale closure.
+  const peersRef = useRef(peers);
+  const selectedIdsRef = useRef(selectedIds);
+  const chatPeerIdRef = useRef(chatPeerId);
+  peersRef.current = peers;
+  selectedIdsRef.current = selectedIds;
+  chatPeerIdRef.current = chatPeerId;
 
   const selectedPeers = useMemo(
     () => peers.filter((peer) => selectedIds.includes(peer.id) && peer.trustState === "paired"),
@@ -170,16 +204,21 @@ export default function App() {
       events.onPeersChanged(setPeers),
       events.onPairingRequest(setPairingRequest),
       events.onSetupChanged(setSetup),
+      events.onTransportError(setError),
       events.onMessage((message) => {
-        setMessages((current) => (message.peerId === chatPeerId ? [...current, message] : current));
-        void api.listPeers().then(setPeers);
+        // Read the open chat through a ref so this listener is set up once instead
+        // of being torn down and rebuilt on every chat switch (peer updates arrive
+        // separately via onPeersChanged).
+        setMessages((current) =>
+          message.peerId === chatPeerIdRef.current ? [...current, message] : current
+        );
       }),
       events.onTransfer((transfer) => {
         // The dock only shows in-flight transfers. Finished rows (complete/failed)
         // drop off — the chat retains the permanent record of files and links.
         setTransfers((current) => {
           const rest = current.filter((item) => item.id !== transfer.id);
-          if (transfer.state === "complete" || transfer.state === "failed") return rest;
+          if (["complete", "failed", "cancelled"].includes(transfer.state)) return rest;
           return [transfer, ...rest].slice(0, TRANSFER_LIMIT);
         });
       }),
@@ -198,9 +237,80 @@ export default function App() {
     return () => {
       void Promise.all(unsubs.map(async (unsubscribe) => (await unsubscribe)()));
     };
-  }, [chatPeerId]);
+  }, []);
 
-  useEffect(() => startAutoUpdate(), []);
+  useEffect(() => startAutoUpdate(setUpdateVersion), []);
+
+  // Native OS drag-drop (dragDropEnabled in tauri.conf.json) delivers real file
+  // paths, unlike HTML5 drops. We hit-test the cursor position to find the target
+  // tile or the chat panel, then stream the dropped paths to that peer.
+  useEffect(() => {
+    function targetAt(physicalX: number, physicalY: number) {
+      const cssX = physicalX / window.devicePixelRatio;
+      const cssY = physicalY / window.devicePixelRatio;
+      const el = document.elementFromPoint(cssX, cssY);
+      if (!el) return null;
+      const tile = el.closest("[data-peer-id]");
+      if (tile) return { kind: "peer" as const, id: tile.getAttribute("data-peer-id") ?? "" };
+      if (el.closest(".chat-panel")) return { kind: "chat" as const };
+      return null;
+    }
+
+    function targetIdsForPeerId(peerId: string): string[] {
+      const list = peersRef.current;
+      const selected = selectedIdsRef.current;
+      const peer = list.find((item) => item.id === peerId);
+      if (!peer || peer.trustState !== "paired") return [];
+      if (selected.includes(peerId)) {
+        return list
+          .filter((item) => selected.includes(item.id) && item.trustState === "paired")
+          .map((item) => item.id);
+      }
+      return [peerId];
+    }
+
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const payload = event.payload;
+        if (payload.type === "enter" || payload.type === "over") {
+          const target = targetAt(payload.position.x, payload.position.y);
+          setDragPeerId(target?.kind === "peer" ? target.id : null);
+          setChatDragActive(target?.kind === "chat");
+        } else if (payload.type === "leave") {
+          setDragPeerId(null);
+          setChatDragActive(false);
+        } else if (payload.type === "drop") {
+          setDragPeerId(null);
+          setChatDragActive(false);
+          const paths = payload.paths ?? [];
+          if (paths.length === 0) return;
+          const target = targetAt(payload.position.x, payload.position.y);
+          let peerIds: string[] = [];
+          if (target?.kind === "peer") peerIds = targetIdsForPeerId(target.id);
+          else if (target?.kind === "chat" && chatPeerIdRef.current) {
+            peerIds = targetIdsForPeerId(chatPeerIdRef.current);
+          }
+          if (peerIds.length === 0) return;
+          api.sendFiles(peerIds, paths).catch((err) => setError(String(err)));
+        }
+      })
+      .then((fn) => {
+        // If cleanup already ran before this promise resolved (StrictMode mounts
+        // the effect twice), detach immediately so we never leak a second live
+        // listener — a leaked listener fires every drop twice.
+        if (cancelled) {
+          fn();
+          return;
+        }
+        unlisten = fn;
+      });
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   useEffect(() => {
     if (!chatPeerId) return;
@@ -232,69 +342,17 @@ export default function App() {
     return targetPeers.map((item) => item.id);
   }
 
-  async function streamFilesToPeers(peer: PeerDevice, files: FileList | File[]) {
-    const peerIds = targetPeerIdsFor(peer);
-    const list = Array.from(files);
-    if (peerIds.length === 0 || list.length === 0) return;
-
-    await Promise.all(
-      list.map(async (file) => {
-        try {
-          const sessionId = await api.beginFileSend(peerIds, file.name, file.size);
-          let offset = 0;
-          while (offset < file.size) {
-            const slice = file.slice(offset, offset + FILE_CHUNK_SIZE);
-            const buffer = await slice.arrayBuffer();
-            await api.sendFileChunk(sessionId, bufferToBase64(buffer), buffer.byteLength);
-            offset += FILE_CHUNK_SIZE;
-          }
-          await api.finishFileSend(sessionId);
-        } catch (err) {
-          setError(err instanceof Error ? err.message : String(err));
-        }
-      })
-    );
-  }
-
-  async function handleDrop(peer: PeerDevice, event: React.DragEvent) {
-    event.preventDefault();
-    setDragPeerId(null);
-    if (peer.trustState !== "paired") return;
-
-    const dt = event.dataTransfer;
-    if (dt.files && dt.files.length > 0) {
-      await streamFilesToPeers(peer, dt.files);
-      return;
-    }
-
-    const text = (dt.getData("text/uri-list") || dt.getData("text/plain")).trim();
-    if (!text) return;
+  async function openShareDialog(peer: PeerDevice) {
     const peerIds = targetPeerIdsFor(peer);
     if (peerIds.length === 0) return;
-
     try {
-      if (looksLikeUrl(text)) {
-        // Progress is delivered through the transfer-progress event stream.
-        await api.sendLink(peerIds, text);
-      } else {
-        await Promise.all(peerIds.map((id) => api.sendMessage(id, text)));
-      }
+      const selection = await openFileDialog({ multiple: true });
+      if (!selection) return;
+      const paths = Array.isArray(selection) ? selection : [selection];
+      if (paths.length === 0) return;
+      await api.sendFiles(peerIds, paths);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  function openShareDialog(peer: PeerDevice) {
-    shareTargetRef.current = peer;
-    shareInputRef.current?.click();
-  }
-
-  async function onShareInputChange(event: React.ChangeEvent<HTMLInputElement>) {
-    const peer = shareTargetRef.current;
-    const files = event.target.files;
-    event.target.value = "";
-    if (peer && files && files.length > 0) {
-      await streamFilesToPeers(peer, files);
     }
   }
 
@@ -307,13 +365,21 @@ export default function App() {
   return (
     <WindowFrame>
     <main className="app-shell">
-      <input
-        ref={shareInputRef}
-        type="file"
-        multiple
-        hidden
-        onChange={onShareInputChange}
-      />
+      {updateVersion && (
+        <div className="update-banner">
+          <Download size={16} />
+          <span>SimplePass {updateVersion} is available.</span>
+          <button
+            className="update-banner-apply"
+            onClick={() => applyPendingUpdate().catch((err) => setError(String(err)))}
+          >
+            Update now
+          </button>
+          <button className="update-banner-dismiss" title="Later" onClick={() => setUpdateVersion(null)}>
+            <X size={14} />
+          </button>
+        </div>
+      )}
       <header className="topbar">
         <div className="brand">
           <BrandMark />
@@ -346,18 +412,6 @@ export default function App() {
                 selected={selectedIds.includes(peer.id)}
                 dragActive={dragPeerId === peer.id}
                 onSelect={() => toggleSelected(peer.id)}
-                onDragOver={(event) => {
-                  if (peer.trustState !== "paired") return;
-                  event.preventDefault();
-                  setDragPeerId(peer.id);
-                }}
-                onDragLeave={(event) => {
-                  // Only clear when the pointer actually leaves the tile, not when it
-                  // crosses onto a child element (which would otherwise flicker the overlay).
-                  const next = event.relatedTarget as Node | null;
-                  if (!event.currentTarget.contains(next)) setDragPeerId(null);
-                }}
-                onDrop={(event) => handleDrop(peer, event)}
                 onPair={() => api.pairPeer(peer.id).catch((err) => setError(String(err)))}
                 onChat={() => setChatPeerId(peer.id)}
                 onShare={() => openShareDialog(peer)}
@@ -377,6 +431,7 @@ export default function App() {
           peer={activeChatPeer}
           messages={messages}
           peerTyping={activeChatPeer ? Boolean(typingPeers[activeChatPeer.id]) : false}
+          dragActive={chatDragActive}
           onClose={() => setChatPeerId(null)}
           onError={setError}
         />
@@ -392,6 +447,15 @@ export default function App() {
               </div>
               <progress value={transfer.progress} max={100} />
               <small>{transfer.state}</small>
+              {(transfer.state === "sending" || transfer.state === "queued") && (
+                <button
+                  className="transfer-cancel"
+                  title="Cancel transfer"
+                  onClick={() => api.cancelFileSend(transfer.id.split(":")[0]).catch((err) => setError(String(err)))}
+                >
+                  <X size={14} />
+                </button>
+              )}
             </div>
           ))}
         </section>
@@ -483,9 +547,6 @@ function DeviceTile(props: {
   selected: boolean;
   dragActive: boolean;
   onSelect: () => void;
-  onDragOver: (event: React.DragEvent) => void;
-  onDragLeave: (event: React.DragEvent) => void;
-  onDrop: (event: React.DragEvent) => void;
   onPair: () => void;
   onChat: () => void;
   onShare: () => void;
@@ -500,9 +561,6 @@ function DeviceTile(props: {
       className={`device-tile ${props.selected ? "selected" : ""} ${paired ? "paired" : "unpaired"} ${
         props.dragActive ? "drag-over" : ""
       }`}
-      onDragOver={props.onDragOver}
-      onDragLeave={props.onDragLeave}
-      onDrop={props.onDrop}
       onClick={props.onSelect}
     >
       <div className="tile-menu">
@@ -562,6 +620,12 @@ function PairingModal({ peer, onAccept, onDeny }: { peer: PeerDevice; onAccept: 
         </div>
         <h2>{peer.name} wants to pair</h2>
         <p>{peer.os || "Computer"} {peer.host ? `on ${peer.host}` : ""}</p>
+        {peer.publicKey && (
+          <p className="pairing-verify">
+            Verify this matches the key shown on that computer:
+            <KeyFingerprint publicKey={peer.publicKey} />
+          </p>
+        )}
         <div className="pairing-actions">
           <button className="secondary" onClick={onDeny}>Deny</button>
           <button className="primary" onClick={onAccept}>Accept</button>
@@ -574,7 +638,7 @@ function PairingModal({ peer, onAccept, onDeny }: { peer: PeerDevice; onAccept: 
 function MessageBubble({ message }: { message: ChatMessage }) {
   if (message.kind === "file") {
     const path = message.filePath;
-    const openable = message.direction === "received" && Boolean(path);
+    const openable = Boolean(path);
     return (
       <div
         className={`message file-message ${message.direction}${openable ? " openable" : ""}`}
@@ -607,11 +671,11 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         title={`Open ${url}`}
         role="button"
         tabIndex={0}
-        onClick={() => api.openPath(url).catch(() => undefined)}
+        onClick={() => api.openLink(url).catch(() => undefined)}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
-            api.openPath(url).catch(() => undefined);
+            api.openLink(url).catch(() => undefined);
           }
         }}
       >
@@ -628,12 +692,14 @@ function ChatPanel({
   peer,
   messages,
   peerTyping,
+  dragActive,
   onClose,
   onError
 }: {
   peer: PeerDevice | null;
   messages: ChatMessage[];
   peerTyping: boolean;
+  dragActive: boolean;
   onClose: () => void;
   onError: (message: string) => void;
 }) {
@@ -683,9 +749,16 @@ function ChatPanel({
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (!text.trim() || !peerId) return;
+    const value = text.trim();
+    if (!value || !peerId) return;
     try {
-      await api.sendMessage(peerId, text.trim());
+      // Native drag-drop replaces HTML5 URL drops, so the composer doubles as the
+      // way to share a link: a bare URL is sent as a link (opens on both sides).
+      if (looksLikeUrl(value)) {
+        await api.sendLink([peerId], value);
+      } else {
+        await api.sendMessage(peerId, value);
+      }
       setText("");
       if (idleTimer.current) clearTimeout(idleTimer.current);
       typingSent.current = false;
@@ -696,7 +769,13 @@ function ChatPanel({
   }
 
   return (
-    <aside className="chat-panel">
+    <aside className={`chat-panel${dragActive ? " drag-over" : ""}`}>
+      {dragActive && (
+        <div className="drop-overlay">
+          <Download size={26} />
+          <span>Drop to send</span>
+        </div>
+      )}
       <header>
         <div className="chat-peer">
           <span className="chat-avatar"><Avatar src={peer.avatar} size={22} /></span>
@@ -742,6 +821,8 @@ function SettingsPanel(props: {
   const [version, setVersion] = useState("");
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
+  const [updateReady, setUpdateReady] = useState(false);
+  const [installing, setInstalling] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -789,15 +870,28 @@ function SettingsPanel(props: {
 
   async function checkUpdates() {
     setChecking(true);
+    setUpdateReady(false);
     setUpdateStatus("Checking for updates...");
-    const outcome = await checkForUpdate(true);
+    const outcome = await checkForUpdate();
     setChecking(false);
     if (outcome.status === "up-to-date") {
       setUpdateStatus("You're on the latest version.");
     } else if (outcome.status === "available") {
-      setUpdateStatus(`Installing version ${outcome.version}...`);
+      setUpdateStatus(`Version ${outcome.version} is available.`);
+      setUpdateReady(true);
     } else {
       setUpdateStatus(`Update check failed: ${outcome.message}`);
+    }
+  }
+
+  async function installUpdate() {
+    setInstalling(true);
+    setUpdateStatus("Downloading and installing...");
+    try {
+      await applyPendingUpdate();
+    } catch (err) {
+      setInstalling(false);
+      setUpdateStatus(`Update failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -829,6 +923,13 @@ function SettingsPanel(props: {
           Start SimplePass when I log in
         </label>
 
+        {props.setup.publicKey && (
+          <div className="device-key-row">
+            <span className="muted">This computer's key</span>
+            <KeyFingerprint publicKey={props.setup.publicKey} />
+          </div>
+        )}
+
         <h3>Trusted devices</h3>
         <div className="trusted-list">
           {props.peers.filter((peer) => peer.trustState === "paired").map((peer) => (
@@ -850,7 +951,13 @@ function SettingsPanel(props: {
         <h3>Updates</h3>
         <div className="update-row">
           <span>Version {version || "…"}</span>
-          <button onClick={checkUpdates} disabled={checking}>Check for updates</button>
+          {updateReady ? (
+            <button className="primary" onClick={installUpdate} disabled={installing}>
+              {installing ? "Installing…" : "Update now"}
+            </button>
+          ) : (
+            <button onClick={checkUpdates} disabled={checking}>Check for updates</button>
+          )}
         </div>
         {updateStatus && <p className="update-status">{updateStatus}</p>}
 

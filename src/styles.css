@@ -455,11 +455,17 @@ input:focus {
 }
 
 .chat-panel {
+  position: relative;
   min-height: 0;
   display: grid;
   grid-template-rows: auto 1fr auto;
   padding: 18px;
   background: var(--paper);
+}
+
+.chat-panel.drag-over {
+  outline: 2px solid var(--clay);
+  outline-offset: -2px;
 }
 
 .chat-panel span {
@@ -521,13 +527,32 @@ input:focus {
 
 .transfer-row {
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) minmax(160px, 2fr) 70px;
+  grid-template-columns: minmax(160px, 1fr) minmax(160px, 2fr) 70px auto;
   align-items: center;
   gap: 12px;
   padding: 10px 12px;
   border: 1px solid var(--line);
   border-radius: 14px;
   background: var(--paper);
+}
+
+.transfer-cancel {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--ink-dim);
+  cursor: pointer;
+  transition: color 140ms ease, border-color 140ms ease;
+}
+
+.transfer-cancel:hover {
+  color: var(--clay);
+  border-color: var(--clay);
 }
 
 .transfer-row div {
@@ -675,6 +700,49 @@ progress::-moz-progress-bar {
   margin: 0;
   font-size: 13px;
   color: var(--ink-dim);
+}
+
+/* Update available banner */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 22px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(90deg, rgba(232, 160, 126, 0.22), rgba(200, 100, 60, 0.14));
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.update-banner > span {
+  flex: 1;
+}
+
+.update-banner-apply {
+  min-height: 32px;
+  padding: 0 14px;
+  border-radius: 10px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--clay);
+  cursor: pointer;
+}
+
+.update-banner-dismiss {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 8px;
+  color: var(--ink-dim);
+  background: transparent;
+  cursor: pointer;
+}
+
+.update-banner-dismiss:hover {
+  color: var(--clay);
 }
 
 /* Avatars */
@@ -908,6 +976,34 @@ progress::-moz-progress-bar {
 .muted {
   margin: 0;
   color: var(--ink-dim);
+  font-size: 13px;
+}
+
+.key-fingerprint {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--surface-2, rgba(0, 0, 0, 0.06));
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+}
+
+.pairing-verify {
+  margin: 6px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--ink-dim);
+  font-size: 12px;
+}
+
+.device-key-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 0 8px;
   font-size: 13px;
 }
 

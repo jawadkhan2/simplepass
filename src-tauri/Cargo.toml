@@ -1,6 +1,6 @@
 [package]
 name = "simplepass"
-version = "0.1.1"
+version = "0.1.2"
 description = "AirDrop-style local network sharing for Windows and macOS"
 authors = ["SimplePass"]
 edition = "2021"
@@ -24,6 +24,7 @@ serde_json = "1.0.133"
 sha2 = "0.10.8"
 tauri = { version = "2.1.1", features = ["tray-icon"] }
 tauri-plugin-autostart = "2.0.2"
+tauri-plugin-dialog = "2.0.1"
 tauri-plugin-notification = "2.0.1"
 tauri-plugin-process = "2.0.0"
 thiserror = "2.0.3"

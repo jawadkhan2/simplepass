@@ -7,6 +7,7 @@ export interface SetupState {
   deviceName: string;
   startAtLogin: boolean;
   avatar?: string | null;
+  publicKey?: string | null;
 }
 
 export interface PeerDevice {
@@ -17,6 +18,7 @@ export interface PeerDevice {
   os: string;
   status: PeerStatus;
   trustState: TrustState;
+  publicKey?: string | null;
   avatar?: string | null;
   lastSeen: number;
 }
@@ -46,6 +48,6 @@ export interface TransferProgress {
   label: string;
   kind: "file" | "link";
   progress: number;
-  state: "queued" | "sending" | "complete" | "failed";
+  state: "queued" | "sending" | "complete" | "failed" | "cancelled";
   error?: string;
 }

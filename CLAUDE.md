@@ -55,7 +55,7 @@ Single-component app. Gates on `setup.configured`: shows `FirstRun` (device nami
 
 ### OTA updates (`src/updater.ts`)
 
-`startAutoUpdate()` (called once from `App.tsx`) checks at launch and every 12 hours, auto-installs from GitHub Releases, and relaunches. Settings exposes a manual check. The updater endpoint and minisign `pubkey` live in `tauri.conf.json` under `plugins.updater`; `createUpdaterArtifacts: true` produces the signed `latest.json`. Release/signing-key details are in the README "Over-the-Air Updates" section.
+`startAutoUpdate()` (called once from `App.tsx`) checks at launch and every 12 hours and *surfaces* availability (a banner) — it does not auto-install. The user triggers download/install/relaunch via `applyPendingUpdate()`. Settings exposes a manual check. The updater endpoint and minisign `pubkey` live in `tauri.conf.json` under `plugins.updater`; `createUpdaterArtifacts: true` produces the signed `latest.json`. Release/signing-key details are in the README "Over-the-Air Updates" section.
 
 ## Conventions
 
@@ -67,3 +67,4 @@ Single-component app. Gates on `setup.configured`: shows `FirstRun` (device nami
 
 - `AGENTS.md` is unrelated tooling config, not project documentation — ignore it.
 - The app is unsigned; installers trip SmartScreen (Windows) and Gatekeeper (macOS). See README for the install workaround.
+- Threat model: the X25519 identity secret and per-peer shared secrets are stored in plaintext in `state.json` (app-data dir). This is accepted — the file is protected only by OS user-account permissions, not an OS keychain. A future hardening step is to move the identity secret into the platform credential store (Windows Credential Manager / macOS Keychain).
