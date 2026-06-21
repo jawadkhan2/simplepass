@@ -9,7 +9,7 @@ const POLL_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
 
 export type UpdateOutcome =
   | { status: "up-to-date" }
-  | { status: "available"; version: string }
+  | { status: "available"; version: string; notes?: string; date?: string }
   | { status: "error"; message: string };
 
 // The most recent Update handle returned by check(). downloadAndInstall must be
@@ -26,7 +26,12 @@ export async function checkForUpdate(): Promise<UpdateOutcome> {
       return { status: "up-to-date" };
     }
     pending = update;
-    return { status: "available", version: update.version };
+    return {
+      status: "available",
+      version: update.version,
+      notes: update.body || undefined,
+      date: update.date || undefined,
+    };
   } catch (err) {
     return { status: "error", message: err instanceof Error ? err.message : String(err) };
   }
@@ -41,13 +46,23 @@ export async function applyPendingUpdate(): Promise<void> {
   await relaunch();
 }
 
+// What the auto-update poll hands back to the UI when a new version is found:
+// enough to render a banner with version + release notes, without re-checking.
+export interface AvailableUpdate {
+  version: string;
+  notes?: string;
+  date?: string;
+}
+
 // Check at launch, then every 12 hours. Reports availability to the caller so it
 // can prompt the user, instead of installing in the background.
 // Returns a cleanup function that stops the polling timer.
-export function startAutoUpdate(onAvailable: (version: string) => void): () => void {
+export function startAutoUpdate(onAvailable: (update: AvailableUpdate) => void): () => void {
   const run = async () => {
     const outcome = await checkForUpdate();
-    if (outcome.status === "available") onAvailable(outcome.version);
+    if (outcome.status === "available") {
+      onAvailable({ version: outcome.version, notes: outcome.notes, date: outcome.date });
+    }
   };
   void run();
   const timer = window.setInterval(() => void run(), POLL_INTERVAL_MS);

@@ -10,6 +10,7 @@ import {
   Minus,
   Monitor,
   MoreVertical,
+  RefreshCw,
   Settings,
   Share2,
   Square,
@@ -20,12 +21,41 @@ import { getVersion } from "@tauri-apps/api/app";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import {
+  isPermissionGranted,
+  onAction as onNotificationAction,
+  requestPermission,
+  sendNotification
+} from "@tauri-apps/plugin-notification";
 import { api, events } from "./tauri";
 import { applyPendingUpdate, checkForUpdate, startAutoUpdate } from "./updater";
+import type { AvailableUpdate } from "./updater";
 import type { ChatMessage, PeerDevice, SetupState, TransferProgress } from "./types";
 
 const TRANSFER_LIMIT = 8;
 const looksLikeUrl = (value: string) => /^https?:\/\/\S+$/i.test(value.trim());
+
+// One-line preview of an incoming message for a toast body.
+function notificationBody(message: ChatMessage): string {
+  if (message.kind === "file") return `Sent a file: ${message.fileName ?? "file"}`;
+  if (message.kind === "link") return message.url ?? "Sent a link";
+  return message.text;
+}
+
+// Show an OS toast for an incoming message, but only while the main window is
+// hidden — when it's visible the in-app chat is already the notification. The
+// notification permission is requested lazily the first time we need it.
+async function notifyIfHidden(message: ChatMessage): Promise<void> {
+  try {
+    if (await getCurrentWindow().isVisible()) return;
+    let granted = await isPermissionGranted();
+    if (!granted) granted = (await requestPermission()) === "granted";
+    if (!granted) return;
+    sendNotification({ title: "SimplePass", body: notificationBody(message) });
+  } catch {
+    // Notifications are best-effort; a failure here must not break message handling.
+  }
+}
 
 function AppIcon({ size = 18 }: { size?: number }) {
   return (
@@ -178,7 +208,8 @@ export default function App() {
   const [dragPeerId, setDragPeerId] = useState<string | null>(null);
   const [chatDragActive, setChatDragActive] = useState(false);
   const [typingPeers, setTypingPeers] = useState<Record<string, boolean>>({});
-  const [updateVersion, setUpdateVersion] = useState<string | null>(null);
+  const [update, setUpdate] = useState<AvailableUpdate | null>(null);
+  const [rescanning, setRescanning] = useState(false);
 
   const typingTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
@@ -212,6 +243,10 @@ export default function App() {
         setMessages((current) =>
           message.peerId === chatPeerIdRef.current ? [...current, message] : current
         );
+        // Toast incoming messages only when the window is hidden, so the user is
+        // alerted without being interrupted while the app is already in front.
+        // Clicking the toast surfaces the window (see the onAction effect below).
+        if (message.direction === "received") void notifyIfHidden(message);
       }),
       events.onTransfer((transfer) => {
         // The dock only shows in-flight transfers. Finished rows (complete/failed)
@@ -239,7 +274,22 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => startAutoUpdate(setUpdateVersion), []);
+  useEffect(() => startAutoUpdate(setUpdate), []);
+
+  // A click on an incoming-message toast brings the main window forward. The
+  // action listener is process-wide, so it is registered once.
+  useEffect(() => {
+    let listener: { unregister: () => Promise<void> } | undefined;
+    let cancelled = false;
+    void onNotificationAction(() => void api.showWindow().catch(() => undefined)).then((handle) => {
+      if (cancelled) void handle.unregister();
+      else listener = handle;
+    });
+    return () => {
+      cancelled = true;
+      if (listener) void listener.unregister();
+    };
+  }, []);
 
   // Native OS drag-drop (dragDropEnabled in tauri.conf.json) delivers real file
   // paths, unlike HTML5 drops. We hit-test the cursor position to find the target
@@ -365,17 +415,20 @@ export default function App() {
   return (
     <WindowFrame>
     <main className="app-shell">
-      {updateVersion && (
+      {update && (
         <div className="update-banner">
           <Download size={16} />
-          <span>SimplePass {updateVersion} is available.</span>
+          <div className="update-banner-text">
+            <span>SimplePass {update.version} is available.</span>
+            {update.notes && <p className="update-banner-notes">{update.notes}</p>}
+          </div>
           <button
             className="update-banner-apply"
             onClick={() => applyPendingUpdate().catch((err) => setError(String(err)))}
           >
             Update now
           </button>
-          <button className="update-banner-dismiss" title="Later" onClick={() => setUpdateVersion(null)}>
+          <button className="update-banner-dismiss" title="Later" onClick={() => setUpdate(null)}>
             <X size={14} />
           </button>
         </div>
@@ -403,6 +456,20 @@ export default function App() {
           <div className="section-heading">
             <h2>Nearby Computers</h2>
             <span>{peers.filter((peer) => peer.status === "online").length} online</span>
+            <button
+              className="rescan-button"
+              title="Rescan the network"
+              disabled={rescanning}
+              onClick={() => {
+                setRescanning(true);
+                api.rescanPeers()
+                  .catch((err) => setError(String(err)))
+                  // Keep the spinner up briefly so a near-instant reply still reads as a scan.
+                  .finally(() => setTimeout(() => setRescanning(false), 900));
+              }}
+            >
+              <RefreshCw size={16} className={rescanning ? "spinning" : ""} />
+            </button>
           </div>
           <div className="device-grid">
             {peers.map((peer) => (
@@ -415,7 +482,10 @@ export default function App() {
                 onPair={() => api.pairPeer(peer.id).catch((err) => setError(String(err)))}
                 onChat={() => setChatPeerId(peer.id)}
                 onShare={() => openShareDialog(peer)}
-                onRevoke={() => api.revokePeer(peer.id).catch((err) => setError(String(err)))}
+                onDelete={() => {
+                  if (!window.confirm(`Delete ${peer.name}? This removes the pairing and its chat history.`)) return;
+                  api.deletePeer(peer.id).catch((err) => setError(String(err)));
+                }}
               />
             ))}
             {peers.length === 0 && (
@@ -550,7 +620,7 @@ function DeviceTile(props: {
   onPair: () => void;
   onChat: () => void;
   onShare: () => void;
-  onRevoke: () => void;
+  onDelete: () => void;
 }) {
   const { peer } = props;
   const paired = peer.trustState === "paired";
@@ -564,11 +634,9 @@ function DeviceTile(props: {
       onClick={props.onSelect}
     >
       <div className="tile-menu">
-        {paired && (
-          <button title="Remove paired computer" onClick={(event) => { event.stopPropagation(); props.onRevoke(); }}>
-            <Trash2 size={16} />
-          </button>
-        )}
+        <button title="Delete computer" onClick={(event) => { event.stopPropagation(); props.onDelete(); }}>
+          <Trash2 size={16} />
+        </button>
         <MoreVertical size={16} />
       </div>
       <div className="device-avatar">
@@ -818,6 +886,13 @@ function SettingsPanel(props: {
   const [deviceName, setDeviceName] = useState(props.setup.deviceName);
   const [startAtLogin, setStartAtLogin] = useState(props.setup.startAtLogin);
   const [avatar, setAvatar] = useState<string | null>(props.setup.avatar ?? null);
+  const [floatingIcon, setFloatingIcon] = useState(props.setup.floatingIcon ?? false);
+  // Serialize floating-icon toggles: rapid clicks fire overlapping set_floating_icon
+  // commands that the backend can complete out of order, so a late show()/hide()
+  // wins over the user's final choice. Run one command at a time and always reapply
+  // the latest desired state.
+  const toggleRunning = useRef(false);
+  const desiredFloating = useRef<boolean | null>(null);
   const [version, setVersion] = useState("");
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
@@ -857,6 +932,30 @@ function SettingsPanel(props: {
     const setup = await api.saveSetup(deviceName.trim(), startAtLogin);
     props.onSetup(setup);
     props.onClose();
+  }
+
+  async function toggleFloatingIcon(enabled: boolean) {
+    // Optimistic flip so the checkbox responds instantly; record the target and let
+    // the running loop pick it up (coalescing rapid clicks to the latest value).
+    setFloatingIcon(enabled);
+    desiredFloating.current = enabled;
+    if (toggleRunning.current) return;
+    toggleRunning.current = true;
+    try {
+      while (desiredFloating.current !== null) {
+        const target = desiredFloating.current;
+        desiredFloating.current = null;
+        const updated = await api.setFloatingIcon(target);
+        props.onSetup(updated);
+      }
+    } catch (err) {
+      // Revert to the last value the backend actually confirmed.
+      desiredFloating.current = null;
+      setFloatingIcon(!enabled);
+      props.onError(err instanceof Error ? err.message : String(err));
+    } finally {
+      toggleRunning.current = false;
+    }
   }
 
   async function clearChat() {
@@ -922,6 +1021,14 @@ function SettingsPanel(props: {
           <input type="checkbox" checked={startAtLogin} onChange={(event) => setStartAtLogin(event.target.checked)} />
           Start SimplePass when I log in
         </label>
+        <label className="check-row">
+          <input
+            type="checkbox"
+            checked={floatingIcon}
+            onChange={(event) => void toggleFloatingIcon(event.target.checked)}
+          />
+          Show a floating desktop icon
+        </label>
 
         {props.setup.publicKey && (
           <div className="device-key-row">
@@ -935,7 +1042,18 @@ function SettingsPanel(props: {
           {props.peers.filter((peer) => peer.trustState === "paired").map((peer) => (
             <div key={peer.id}>
               <span>{peer.name}</span>
-              <button onClick={() => api.revokePeer(peer.id)}>Remove</button>
+              <div className="trusted-actions">
+                <button onClick={() => api.revokePeer(peer.id).catch((err) => props.onError(String(err)))}>Unpair</button>
+                <button
+                  className="link-button danger"
+                  onClick={() => {
+                    if (!window.confirm(`Delete ${peer.name}? This removes the pairing and its chat history.`)) return;
+                    api.deletePeer(peer.id).catch((err) => props.onError(String(err)));
+                  }}
+                >
+                  Delete
+                </button>
+              </div>
             </div>
           ))}
           {props.peers.filter((peer) => peer.trustState === "paired").length === 0 && (

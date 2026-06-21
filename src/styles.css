@@ -315,6 +315,7 @@ input:focus {
   background: rgba(125, 138, 92, 0.14);
   padding: 5px 12px;
   border-radius: 999px;
+  margin-left: auto;
 }
 
 .device-grid {
@@ -627,6 +628,10 @@ progress::-moz-progress-bar {
 .settings-panel,
 .pairing-panel {
   width: min(520px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
   display: grid;
   gap: 18px;
   padding: 24px;
@@ -634,6 +639,12 @@ progress::-moz-progress-bar {
   background: var(--card);
   border: 1px solid var(--line);
   box-shadow: 0 28px 70px rgba(60, 45, 28, 0.26);
+}
+
+.settings-panel::-webkit-scrollbar,
+.pairing-panel::-webkit-scrollbar {
+  width: 0;
+  height: 0;
 }
 
 .pairing-panel {
@@ -715,8 +726,19 @@ progress::-moz-progress-bar {
   font-weight: 600;
 }
 
-.update-banner > span {
+.update-banner-text {
   flex: 1;
+  min-width: 0;
+}
+
+.update-banner-notes {
+  margin: 3px 0 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ink-dim);
+  white-space: pre-wrap;
+  max-height: 120px;
+  overflow-y: auto;
 }
 
 .update-banner-apply {
@@ -1005,6 +1027,159 @@ progress::-moz-progress-bar {
   gap: 2px;
   margin: 4px 0 8px;
   font-size: 13px;
+}
+
+/* Rescan nearby computers */
+.rescan-button {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 9px;
+  color: var(--ink-dim);
+  background: transparent;
+  cursor: pointer;
+}
+
+.rescan-button:hover:not(:disabled) {
+  color: var(--clay);
+  background: rgba(200, 100, 60, 0.12);
+}
+
+.rescan-button:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.rescan-button .spinning {
+  animation: rescan-spin 0.9s linear infinite;
+}
+
+@keyframes rescan-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Trusted-device row actions */
+.trusted-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.link-button.danger {
+  color: #c0392b;
+}
+
+/* Floating desktop widget */
+.widget-mode,
+.widget-mode body,
+.widget-mode #root {
+  background: transparent;
+  overflow: hidden;
+}
+
+.fi-root {
+  display: flex;
+  align-items: center;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.floating-icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 72px;
+  width: 72px;
+  height: 72px;
+  padding: 6px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.floating-icon svg {
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.35));
+  transition: transform 0.12s ease;
+  pointer-events: none;
+}
+
+.floating-icon:hover svg {
+  transform: scale(1.08);
+}
+
+.floating-icon:active svg {
+  transform: scale(0.96);
+}
+
+/* Highlight ring while files hover over the icon. */
+.floating-icon.drag-over svg {
+  transform: scale(1.12);
+  filter: drop-shadow(0 0 0 2px rgba(232, 160, 126, 0.9)) drop-shadow(0 4px 12px rgba(0, 0, 0, 0.4));
+}
+
+/* Status pill shown to the right of the icon during a drop / send / result. */
+.fi-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 auto;
+  min-width: 0;
+  margin-right: 8px;
+  padding: 8px 11px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(28, 28, 30, 0.92);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+
+.fi-status svg {
+  flex: 0 0 auto;
+}
+
+.fi-status-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fi-status.dragover {
+  background: rgba(176, 86, 48, 0.95);
+}
+
+.fi-status.success {
+  background: rgba(34, 134, 75, 0.95);
+}
+
+.fi-status.error {
+  background: rgba(176, 50, 45, 0.95);
+}
+
+.fi-status.cancelled {
+  background: rgba(90, 90, 96, 0.95);
+}
+
+.fi-spinner {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: fi-spin 0.7s linear infinite;
+}
+
+@keyframes fi-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 @media (max-width: 860px) {

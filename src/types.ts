@@ -7,6 +7,7 @@ export interface SetupState {
   deviceName: string;
   startAtLogin: boolean;
   avatar?: string | null;
+  floatingIcon?: boolean;
   publicKey?: string | null;
 }
 

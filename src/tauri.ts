@@ -7,17 +7,27 @@ export const api = {
   saveSetup: (deviceName: string, startAtLogin: boolean) =>
     invoke<SetupState>("save_setup", { deviceName, startAtLogin }),
   setAvatar: (avatar: string | null) => invoke<SetupState>("set_avatar", { avatar }),
+  setFloatingIcon: (enabled: boolean) => invoke<SetupState>("set_floating_icon", { enabled }),
+  saveWidgetPosition: (x: number, y: number) => invoke<void>("save_widget_position", { x, y }),
+  showWindow: () => invoke<void>("show_window"),
   listPeers: () => invoke<PeerDevice[]>("list_peers"),
+  recentPeer: () => invoke<PeerDevice | null>("recent_peer"),
+  rescanPeers: () => invoke<void>("rescan_peers"),
   pairPeer: (peerId: string) => invoke<void>("pair_peer", { peerId }),
   acceptPairing: (peerId: string) => invoke<void>("accept_pairing", { peerId }),
   denyPairing: (peerId: string) => invoke<void>("deny_pairing", { peerId }),
   revokePeer: (peerId: string) => invoke<void>("revoke_peer", { peerId }),
+  deletePeer: (peerId: string) => invoke<void>("delete_peer", { peerId }),
   listMessages: (peerId: string) => invoke<ChatMessage[]>("list_messages", { peerId }),
   sendMessage: (peerId: string, text: string) => invoke<void>("send_message", { peerId, text }),
   sendTyping: (peerId: string, isTyping: boolean) =>
     invoke<void>("send_typing", { peerId, isTyping }),
   sendLink: (peerIds: string[], url: string) => invoke<TransferProgress[]>("send_link", { peerIds, url }),
   sendFiles: (peerIds: string[], paths: string[]) => invoke<void>("send_files", { peerIds, paths }),
+  stageFileChunk: (sessionId: string, data: string) =>
+    invoke<void>("stage_file_chunk", { sessionId, data }),
+  sendStagedFile: (peerIds: string[], sessionId: string, fileName: string) =>
+    invoke<void>("send_staged_file", { peerIds, sessionId, fileName }),
   cancelFileSend: (transferId: string) => invoke<void>("cancel_file_send", { transferId }),
   clearMessages: () => invoke<void>("clear_messages"),
   openPath: (path: string) => invoke<void>("open_path", { path }),

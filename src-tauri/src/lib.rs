@@ -22,10 +22,9 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State, WindowEvent,
+    AppHandle, Emitter, LogicalPosition, Manager, State, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
-use tauri_plugin_notification::NotificationExt;
 use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -58,6 +57,15 @@ struct SetupState {
     start_at_login: bool,
     #[serde(default)]
     avatar: Option<String>,
+    /// Whether the always-on-top floating desktop icon is shown.
+    #[serde(default)]
+    floating_icon: bool,
+    /// Last on-screen position of the floating icon, so it reappears where the
+    /// user left it across launches.
+    #[serde(default)]
+    widget_x: Option<f64>,
+    #[serde(default)]
+    widget_y: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +76,8 @@ struct SetupResponse {
     device_name: String,
     start_at_login: bool,
     avatar: Option<String>,
+    #[serde(default)]
+    floating_icon: bool,
     /// Our own X25519 public key (base64), so the UI can show a verification
     /// fingerprint the user can read out-of-band when approving a pairing.
     public_key: Option<String>,
@@ -172,6 +182,9 @@ impl Default for PersistedState {
                 device_name: String::new(),
                 start_at_login: true,
                 avatar: None,
+                floating_icon: false,
+                widget_x: None,
+                widget_y: None,
             },
             peers: Vec::new(),
             messages: Vec::new(),
@@ -189,6 +202,11 @@ struct DiscoveryPacket {
     public_key: String,
     os: String,
     port: u16,
+    // When true, this is a rescan probe: receivers should immediately re-announce
+    // themselves so the requester learns about them without waiting for the next
+    // periodic broadcast. `serde(default)` keeps it compatible with older peers.
+    #[serde(default)]
+    request: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +219,7 @@ enum WireMessage {
     FileStart { peer_id: String, transfer_id: String, file_name: String, total_size: u64 },
     FileChunk { peer_id: String, transfer_id: String, data: String },
     FileEnd { peer_id: String, transfer_id: String },
+    FileCancel { peer_id: String, transfer_id: String },
     Typing { peer_id: String, is_typing: bool },
     Profile { peer_id: String, avatar: Option<String> },
 }
@@ -259,13 +278,17 @@ fn save_setup(
         return Err("Device name is required.".to_string());
     }
 
+    let existing = state.inner.lock().map_err(lock_err)?.setup.clone();
     let setup = SetupState {
         configured: true,
         device_id: existing_device_id(&state)?,
         identity_secret: existing_identity_secret(&state)?,
         device_name: cleaned.to_string(),
         start_at_login,
-        avatar: state.inner.lock().map_err(lock_err)?.setup.avatar.clone(),
+        avatar: existing.avatar.clone(),
+        floating_icon: existing.floating_icon,
+        widget_x: existing.widget_x,
+        widget_y: existing.widget_y,
     };
 
     {
@@ -281,6 +304,34 @@ fn save_setup(
 #[tauri::command]
 fn list_peers(state: State<AppState>) -> AppResult<Vec<PeerDevice>> {
     Ok(state.inner.lock().map_err(lock_err)?.peers.clone())
+}
+
+/// The paired peer most recently chatted with (by latest message timestamp),
+/// falling back to the most-recently-seen paired peer when there is no chat
+/// history yet. The floating widget uses this to auto-pick a drop target.
+#[tauri::command]
+fn recent_peer(state: State<AppState>) -> AppResult<Option<PeerDevice>> {
+    let persisted = state.inner.lock().map_err(lock_err)?;
+    let mut paired: Vec<PeerDevice> = persisted
+        .peers
+        .iter()
+        .filter(|peer| peer.trust_state == "paired")
+        .cloned()
+        .collect();
+    if paired.is_empty() {
+        return Ok(None);
+    }
+    let last_msg = |peer: &PeerDevice| -> Option<i64> {
+        persisted
+            .messages
+            .iter()
+            .filter(|message| message.peer_id == peer.id)
+            .map(|message| message.created_at)
+            .max()
+    };
+    // Newest chat first; peers with no messages (None) sort last, broken by last_seen.
+    paired.sort_by(|a, b| last_msg(b).cmp(&last_msg(a)).then(b.last_seen.cmp(&a.last_seen)));
+    Ok(paired.into_iter().next())
 }
 
 #[tauri::command]
@@ -388,6 +439,44 @@ fn revoke_peer(app: AppHandle, state: State<AppState>, peer_id: String) -> AppRe
     app.emit("peers-changed", peers).map_err(|err| err.to_string())
 }
 
+/// Completely forget a device: remove its record plus all chat history and
+/// transfer rows tied to it. Unlike `revoke_peer` (which only un-pairs), the peer
+/// disappears entirely. A device still broadcasting on the LAN will re-appear as
+/// a fresh *unpaired* peer; deletion clears trust and history, not discovery.
+#[tauri::command]
+fn delete_peer(app: AppHandle, state: State<AppState>, peer_id: String) -> AppResult<()> {
+    let peers = {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        persisted.peers.retain(|peer| peer.id != peer_id);
+        persisted.messages.retain(|message| message.peer_id != peer_id);
+        persisted.transfers.retain(|transfer| transfer.peer_id != peer_id);
+        let peers = persisted.peers.clone();
+        save_state(&state.path, &persisted)?;
+        peers
+    };
+    app.emit("peers-changed", peers).map_err(|err| err.to_string())
+}
+
+/// Manually probe the LAN: broadcast a discovery packet with `request = true` so
+/// every peer re-announces immediately (instead of waiting for its next periodic
+/// broadcast), refresh stale status, and push the current peer list to the UI.
+#[tauri::command]
+fn rescan_peers(app: AppHandle, state: State<AppState>) -> AppResult<()> {
+    let mut packet = local_discovery_packet(&state)?;
+    packet.request = true;
+    let body = serde_json::to_vec(&packet).map_err(|err| err.to_string())?;
+
+    let socket = UdpSocket::bind(("0.0.0.0", 0)).map_err(|err| err.to_string())?;
+    socket.set_broadcast(true).map_err(|err| err.to_string())?;
+    socket
+        .send_to(&body, SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT)))
+        .map_err(|err| err.to_string())?;
+
+    let _ = mark_stale_peers_offline(&app, &state, now_ms());
+    let peers = { state.inner.lock().map_err(lock_err)?.peers.clone() };
+    app.emit("peers-changed", peers).map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 fn list_messages(state: State<AppState>, peer_id: String) -> AppResult<Vec<ChatMessage>> {
     let persisted = state.inner.lock().map_err(lock_err)?;
@@ -414,22 +503,8 @@ fn send_message(app: AppHandle, state: State<AppState>, peer_id: String, text: S
 fn receive_message(app: &AppHandle, state: &State<AppState>, peer_id: String, text: String) -> AppResult<()> {
     ensure_paired(state, &peer_id)?;
     let message = make_chat_message(peer_id, "received", "text", text);
-
-    // Only toast when the window is hidden (minimized to the tray). If it's open,
-    // the message lands in the chat in view — no notification needed.
-    let window_hidden = app
-        .get_webview_window("main")
-        .and_then(|window| window.is_visible().ok())
-        .map(|visible| !visible)
-        .unwrap_or(true);
-    if window_hidden {
-        let _ = app
-            .notification()
-            .builder()
-            .title("SimplePass")
-            .body("New chat message")
-            .show();
-    }
+    // The toast (and its click-to-open behavior) is raised on the frontend from
+    // the `chat-message` event, so a click can focus the window via `show_window`.
     record_chat_message(app, state, message)
 }
 
@@ -542,7 +617,7 @@ fn send_files(
 
     thread::spawn(move || {
         for path in paths {
-            send_one_file(&app, &local_id, &targets, &path);
+            send_one_file(&app, &local_id, &targets, &path, None, Some(&path));
         }
     });
     Ok(())
@@ -551,14 +626,30 @@ fn send_files(
 /// Connect to every target, stream a single file in chunks, and record the sent
 /// message. Best-effort: a per-peer failure marks only that row failed; a cancel
 /// stops the stream and skips the chat record.
-fn send_one_file(app: &AppHandle, local_id: &str, targets: &[(PeerDevice, String)], path: &str) {
+///
+/// `display_name` overrides the name shown to the receiver (used when streaming a
+/// staged temp file whose on-disk name is a random session id). `record_path` is
+/// the local path stored on the sent chat message for click-to-open, or `None`
+/// when the source is transient (e.g. a widget byte-drop) and has no stable path.
+fn send_one_file(
+    app: &AppHandle,
+    local_id: &str,
+    targets: &[(PeerDevice, String)],
+    path: &str,
+    display_name: Option<&str>,
+    record_path: Option<&str>,
+) {
     let state = app.state::<AppState>();
     let transfer_id = Uuid::new_v4().to_string();
     let source = Path::new(path);
-    let file_name = source
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
+    let file_name = display_name
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| {
+            source
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string())
+        });
 
     let mut file = match fs::File::open(source) {
         Ok(file) => file,
@@ -692,6 +783,20 @@ fn send_one_file(app: &AppHandle, local_id: &str, targets: &[(PeerDevice, String
             );
             let _ = conn.stream.flush();
         }
+    } else if cancelled {
+        // Tell each receiver to discard the partial file it has been writing.
+        for conn in conns.iter_mut().filter(|conn| !conn.failed) {
+            let _ = write_encrypted_line(
+                &mut conn.stream,
+                local_id,
+                &conn.secret,
+                &WireMessage::FileCancel {
+                    peer_id: local_id.to_string(),
+                    transfer_id: transfer_id.clone(),
+                },
+            );
+            let _ = conn.stream.flush();
+        }
     }
 
     if let Ok(mut cancels) = state.cancels.lock() {
@@ -721,7 +826,7 @@ fn send_one_file(app: &AppHandle, local_id: &str, targets: &[(PeerDevice, String
             let mut message = make_chat_message(conn.peer_id.clone(), "sent", "file", file_name.clone());
             message.file_name = Some(file_name.clone());
             message.file_size = Some(total);
-            message.file_path = Some(path.to_string());
+            message.file_path = record_path.map(|p| p.to_string());
             let _ = record_chat_message(app, &state, message);
         }
     }
@@ -769,6 +874,88 @@ fn cancel_file_send(state: State<AppState>, transfer_id: String) -> AppResult<()
     Ok(())
 }
 
+/// Temp path a widget byte-drop is staged into. The session id is generated by the
+/// frontend (a UUID); we still constrain it to a safe alphabet so it can never
+/// escape the temp dir or collide with an unrelated file.
+fn staged_file_path(session_id: &str) -> AppResult<PathBuf> {
+    if session_id.is_empty()
+        || !session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err("Invalid staging id.".to_string());
+    }
+    Ok(std::env::temp_dir().join(format!("simplepass-stage-{session_id}")))
+}
+
+/// Append a base64 chunk of a dropped file to its staging temp file. The floating
+/// widget runs with native drag-drop disabled (so it can also accept text/links),
+/// which means dropped files arrive as in-page bytes with no OS path. The frontend
+/// reads the file in slices and streams them here; `send_staged_file` then sends
+/// the assembled temp file through the normal chunked transport.
+#[tauri::command]
+fn stage_file_chunk(session_id: String, data: String) -> AppResult<()> {
+    let path = staged_file_path(&session_id)?;
+    let bytes = BASE64.decode(data.as_bytes()).map_err(|err| err.to_string())?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|err| err.to_string())?;
+    file.write_all(&bytes).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// Send a file previously assembled by `stage_file_chunk` to the given peers under
+/// its original name, then delete the temp file. Reuses the same chunked, cancelable
+/// streaming path as `send_files`; the local chat record carries no file path since
+/// the staged copy is transient.
+#[tauri::command]
+fn send_staged_file(
+    app: AppHandle,
+    state: State<AppState>,
+    peer_ids: Vec<String>,
+    session_id: String,
+    file_name: String,
+) -> AppResult<()> {
+    if peer_ids.is_empty() {
+        return Err("No target devices.".to_string());
+    }
+    let staged = staged_file_path(&session_id)?;
+    if !staged.exists() {
+        return Err("Nothing was staged to send.".to_string());
+    }
+    let local_id = existing_device_id(&state)?;
+
+    // Resolve + validate targets up front, mirroring send_files, so problems surface
+    // synchronously instead of inside the worker thread.
+    let mut targets = Vec::new();
+    for peer_id in &peer_ids {
+        let peer = get_peer(&state, peer_id)?;
+        if peer.trust_state != "paired" {
+            return Err(format!("{} is not paired.", peer.name));
+        }
+        if peer.host.trim().is_empty() {
+            return Err(format!("{} does not have a network address yet.", peer.name));
+        }
+        let secret = peer
+            .shared_secret
+            .clone()
+            .ok_or_else(|| format!("{} does not have a shared secret yet.", peer.name))?;
+        targets.push((peer, secret));
+    }
+
+    let name = if file_name.trim().is_empty() {
+        "file".to_string()
+    } else {
+        file_name
+    };
+    thread::spawn(move || {
+        let path = staged.to_string_lossy().to_string();
+        send_one_file(&app, &local_id, &targets, &path, Some(&name), None);
+        let _ = fs::remove_file(&staged);
+    });
+    Ok(())
+}
+
 #[tauri::command]
 fn send_typing(state: State<AppState>, peer_id: String, is_typing: bool) -> AppResult<()> {
     let local_id = existing_device_id(&state)?;
@@ -796,7 +983,10 @@ fn clear_transfers(state: State<AppState>) -> AppResult<()> {
 
 #[tauri::command]
 fn open_path(path: String) -> AppResult<()> {
-    open::that(path).map_err(|err| err.to_string())
+    // that_detached -> ShellExecuteExW on Windows (passes the full UTF-16 path to the
+    // shell). Plain open::that goes via `cmd /c start`, which corrupts non-ASCII chars
+    // in the path (e.g. an em dash in a received file name) so the OS can't find it.
+    open::that_detached(path).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -848,6 +1038,11 @@ pub fn run() {
             let path = app_data_file(app.handle())?;
             let persisted = load_state(&path);
             let _ = configure_autostart(app.handle(), persisted.setup.start_at_login);
+            let widget = (
+                persisted.setup.floating_icon,
+                persisted.setup.widget_x,
+                persisted.setup.widget_y,
+            );
             app.manage(AppState {
                 path,
                 inner: Mutex::new(persisted),
@@ -855,6 +1050,10 @@ pub fn run() {
                 cancels: Mutex::new(HashMap::new()),
             });
             build_tray(app.handle())?;
+            if widget.0 {
+                let _ = open_widget_window(app.handle(), widget.1, widget.2);
+            }
+            keep_widget_on_top(app.handle());
             start_transport(app.handle().clone());
             Ok(())
         })
@@ -869,21 +1068,29 @@ pub fn run() {
             get_setup_state,
             save_setup,
             list_peers,
+            recent_peer,
             pair_peer,
             accept_pairing,
             deny_pairing,
             revoke_peer,
+            delete_peer,
+            rescan_peers,
             list_messages,
             send_message,
             send_link,
             send_files,
+            stage_file_chunk,
+            send_staged_file,
             cancel_file_send,
             send_typing,
             clear_messages,
             clear_transfers,
             set_avatar,
             open_path,
-            open_link
+            open_link,
+            show_window,
+            set_floating_icon,
+            save_widget_position
         ])
         .run(tauri::generate_context!())
         .expect("error while running SimplePass");
@@ -1022,6 +1229,9 @@ fn handle_message(
         WireMessage::FileEnd { peer_id, transfer_id } => {
             receive_file_end(app, state, peer_id, transfer_id)?;
         }
+        WireMessage::FileCancel { peer_id, transfer_id } => {
+            receive_file_cancel(app, state, peer_id, transfer_id)?;
+        }
     }
     Ok(())
 }
@@ -1066,11 +1276,21 @@ fn run_discovery(app: AppHandle) {
                 if let Ok(mut packet) = serde_json::from_slice::<DiscoveryPacket>(&buffer[..size]) {
                     if packet.magic == DISCOVERY_MAGIC {
                         packet.port = if packet.port == 0 { TRANSPORT_PORT } else { packet.port };
+                        let is_request = packet.request;
                         if let Some(state) = app.try_state::<AppState>() {
                             if let Ok(local_id) = existing_device_id(&state) {
                                 if packet.device_id != local_id {
                                     let mut packet_with_host = packet;
                                     let _ = upsert_peer_from_addr(&app, &state, &mut packet_with_host, addr);
+                                    // Answer a rescan probe by immediately announcing
+                                    // ourselves so the requester sees us right away.
+                                    if is_request {
+                                        if let Ok(reply) = local_discovery_packet(&state) {
+                                            if let Ok(body) = serde_json::to_vec(&reply) {
+                                                let _ = socket.send_to(&body, addr);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1281,6 +1501,7 @@ fn envelope_peer_id(message: &WireMessage) -> AppResult<&str> {
         | WireMessage::FileStart { peer_id, .. }
         | WireMessage::FileChunk { peer_id, .. }
         | WireMessage::FileEnd { peer_id, .. }
+        | WireMessage::FileCancel { peer_id, .. }
         | WireMessage::Typing { peer_id, .. }
         | WireMessage::Profile { peer_id, .. } => Ok(peer_id),
         WireMessage::PairRequest { .. } | WireMessage::PairAccepted { .. } => {
@@ -1296,13 +1517,33 @@ fn setup_response(setup: &SetupState) -> SetupResponse {
         device_name: setup.device_name.clone(),
         start_at_login: setup.start_at_login,
         avatar: setup.avatar.clone(),
+        floating_icon: setup.floating_icon,
         public_key: derive_public_key(&setup.identity_secret).ok(),
     }
 }
 
+/// Whether a `Plain` (unencrypted) envelope may carry this message. Only the
+/// pairing handshake qualifies — every other variant must be encrypted.
+fn plain_envelope_allowed(message: &WireMessage) -> bool {
+    matches!(
+        message,
+        WireMessage::PairRequest { .. } | WireMessage::PairAccepted { .. }
+    )
+}
+
 fn decrypt_envelope(state: &State<AppState>, envelope: TransportEnvelope) -> AppResult<WireMessage> {
     match envelope {
-        TransportEnvelope::Plain { message } => Ok(message),
+        // Pairing is the only handshake that legitimately travels in the clear
+        // (no shared secret exists yet). Every other message — chat, links,
+        // files, typing, profile — must arrive encrypted, or a LAN attacker
+        // could inject unauthenticated plaintext that bypasses E2EE entirely.
+        TransportEnvelope::Plain { message } => {
+            if plain_envelope_allowed(&message) {
+                Ok(message)
+            } else {
+                Err("Rejected an unencrypted message; only pairing may be sent in the clear.".to_string())
+            }
+        }
         TransportEnvelope::Encrypted { peer_id, nonce, body } => {
             let peer = get_peer(state, &peer_id)?;
             let secret = peer
@@ -1381,6 +1622,7 @@ fn local_discovery_packet(state: &State<AppState>) -> AppResult<DiscoveryPacket>
         public_key: derive_public_key(&persisted.setup.identity_secret)?,
         os: std::env::consts::OS.to_string(),
         port: TRANSPORT_PORT,
+        request: false,
     })
 }
 
@@ -1474,7 +1716,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => show_window(app),
+            "show" => reveal_main_window(app),
             "quit" => app.exit(0),
             _ => {}
         })
@@ -1485,18 +1727,109 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                show_window(tray.app_handle());
+                reveal_main_window(tray.app_handle());
             }
         })
         .build(app)?;
     Ok(())
 }
 
-fn show_window(app: &AppHandle) {
+fn reveal_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
+        let _ = window.unminimize();
         let _ = window.set_focus();
     }
+}
+
+/// Frontend-callable: bring the main window to the foreground. Used when the user
+/// clicks a notification toast or the floating desktop icon.
+#[tauri::command]
+fn show_window(app: AppHandle) -> AppResult<()> {
+    reveal_main_window(&app);
+    Ok(())
+}
+
+const WIDGET_LABEL: &str = "widget";
+
+/// Reveal the always-on-top floating desktop icon. The widget is a window declared
+/// in `tauri.conf.json` (hidden at launch) rather than one built here at runtime:
+/// it must have `dragDropEnabled: false` so the webview receives HTML5 drag-drop
+/// (text, links, *and* file bytes), and that flag is only honoured when set in the
+/// config — `WebviewWindowBuilder::drag_and_drop(false)` is silently ignored on
+/// Windows (tauri-apps/tauri#13761). `main.tsx` renders `<FloatingIcon>` for the
+/// `widget` label instead of the full app.
+fn open_widget_window(app: &AppHandle, x: Option<f64>, y: Option<f64>) -> AppResult<()> {
+    let window = app
+        .get_webview_window(WIDGET_LABEL)
+        .ok_or_else(|| "Floating widget window is unavailable.".to_string())?;
+    if let (Some(x), Some(y)) = (x, y) {
+        let _ = window.set_position(LogicalPosition::new(x, y));
+    }
+    window.show().map_err(|err| err.to_string())?;
+    // Re-assert topmost on every reveal: the config flag is set once at creation,
+    // but Windows drops a window's topmost z-order when another app claims it
+    // (fullscreen apps, explorer.exe restarts), so it must be re-applied.
+    let _ = window.set_always_on_top(true);
+    let _ = window.set_focus();
+    Ok(())
+}
+
+/// Keep the floating widget pinned above other windows. Windows silently revokes a
+/// window's topmost flag when another process grabs it (fullscreen apps, taskbar/
+/// explorer restarts, display changes), which makes the widget "randomly" vanish
+/// behind other windows. Re-asserting topmost on a slow interval restores it; the
+/// reassert is a no-op `SetWindowPos` (no move/resize, no flicker) and only runs
+/// while the widget is actually visible, so it never un-hides a disabled widget.
+fn keep_widget_on_top(app: &AppHandle) {
+    let app = app.clone();
+    thread::spawn(move || loop {
+        thread::sleep(std::time::Duration::from_secs(2));
+        if let Some(win) = app.get_webview_window(WIDGET_LABEL) {
+            if matches!(win.is_visible(), Ok(true)) {
+                let _ = win.set_always_on_top(true);
+            }
+        }
+    });
+}
+
+fn close_widget_window(app: &AppHandle) {
+    // Hide rather than close: the window is declared in the config, so closing it
+    // would destroy it with no builder to recreate it on the next toggle.
+    if let Some(win) = app.get_webview_window(WIDGET_LABEL) {
+        let _ = win.hide();
+    }
+}
+
+/// Toggle the floating desktop icon on/off and persist the preference.
+#[tauri::command]
+fn set_floating_icon(app: AppHandle, state: State<AppState>, enabled: bool) -> AppResult<SetupResponse> {
+    let (response, x, y) = {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        persisted.setup.floating_icon = enabled;
+        save_state(&state.path, &persisted)?;
+        (
+            setup_response(&persisted.setup),
+            persisted.setup.widget_x,
+            persisted.setup.widget_y,
+        )
+    };
+    if enabled {
+        open_widget_window(&app, x, y)?;
+    } else {
+        close_widget_window(&app);
+    }
+    let _ = app.emit("setup-changed", response.clone());
+    Ok(response)
+}
+
+/// Persist where the user dragged the floating icon, so it returns there next time.
+#[tauri::command]
+fn save_widget_position(state: State<AppState>, x: f64, y: f64) -> AppResult<()> {
+    let mut persisted = state.inner.lock().map_err(lock_err)?;
+    persisted.setup.widget_x = Some(x);
+    persisted.setup.widget_y = Some(y);
+    save_state(&state.path, &persisted)
 }
 
 fn configure_autostart(app: &AppHandle, enabled: bool) -> AppResult<()> {
@@ -1527,7 +1860,11 @@ fn open_link(url: String) -> AppResult<()> {
 }
 
 fn open_url(url: &str) -> AppResult<()> {
-    if cfg!(target_os = "windows") {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: don't flash a console window when launching Chrome.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let chrome_paths = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -1535,6 +1872,7 @@ fn open_url(url: &str) -> AppResult<()> {
         for path in chrome_paths {
             if Path::new(path).exists() {
                 return std::process::Command::new(path)
+                    .creation_flags(CREATE_NO_WINDOW)
                     .arg("--new-tab")
                     .arg(url)
                     .spawn()
@@ -1544,7 +1882,8 @@ fn open_url(url: &str) -> AppResult<()> {
         }
     }
 
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         let chrome = Path::new("/Applications/Google Chrome.app");
         if chrome.exists() {
             return std::process::Command::new("open")
@@ -1555,7 +1894,7 @@ fn open_url(url: &str) -> AppResult<()> {
         }
     }
 
-    open::that(url).map_err(|err| err.to_string())
+    open::that_detached(url).map_err(|err| err.to_string())
 }
 
 fn receive_file_start(
@@ -1715,6 +2054,41 @@ fn receive_file_end(
     )
 }
 
+/// Receiver side of a sender-initiated cancel: drop the in-progress entry, delete
+/// the partial file from disk (best-effort), and report the transfer cancelled.
+fn receive_file_cancel(
+    app: &AppHandle,
+    state: &State<AppState>,
+    peer_id: String,
+    transfer_id: String,
+) -> AppResult<()> {
+    ensure_paired(state, &peer_id)?;
+    let entry = {
+        let mut incoming = state.incoming_files.lock().map_err(lock_err)?;
+        incoming.remove(&transfer_id)
+    };
+    // Nothing reserved (e.g. cancel arrived before FileStart) — nothing to clean up.
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+
+    let _ = fs::remove_file(&entry.path);
+
+    emit_transfer(
+        app,
+        TransferProgress {
+            id: transfer_id,
+            peer_id,
+            peer_name: entry.peer_name,
+            label: entry.file_name,
+            kind: "file".to_string(),
+            progress: 0,
+            state: "cancelled".to_string(),
+            error: None,
+        },
+    )
+}
+
 /// Reserve a unique destination in `downloads`, creating the (empty) file
 /// atomically with `create_new` so two concurrent transfers can never claim the
 /// same path. Without this, a plain `exists()` check is a TOCTOU race: both
@@ -1861,6 +2235,32 @@ mod tests {
                 TransportEnvelope::Plain { .. } => panic!("expected encrypted envelope"),
             }
         }
+    }
+
+    #[test]
+    fn plain_envelopes_allowed_only_for_pairing() {
+        let device = DiscoveryPacket {
+            magic: DISCOVERY_MAGIC.to_string(),
+            device_id: "peer".to_string(),
+            device_name: "Peer".to_string(),
+            public_key: "key".to_string(),
+            os: "windows".to_string(),
+            port: TRANSPORT_PORT,
+            request: false,
+        };
+        assert!(plain_envelope_allowed(&WireMessage::PairRequest { device: device.clone() }));
+        assert!(plain_envelope_allowed(&WireMessage::PairAccepted { device }));
+
+        // Chat, links, files, typing, profile must never be accepted in the clear.
+        assert!(!plain_envelope_allowed(&WireMessage::Chat {
+            peer_id: "peer".to_string(),
+            text: "hi".to_string(),
+        }));
+        assert!(!plain_envelope_allowed(&WireMessage::FileChunk {
+            peer_id: "peer".to_string(),
+            transfer_id: "t1".to_string(),
+            data: BASE64.encode(b"bytes"),
+        }));
     }
 
     #[test]

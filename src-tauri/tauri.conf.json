@@ -11,8 +11,10 @@
   },
   "app": {
     "withGlobalTauri": false,
+    "macOSPrivateApi": true,
     "windows": [
       {
+        "label": "main",
         "title": "SimplePass",
         "width": 1120,
         "height": 760,
@@ -23,6 +25,20 @@
         "fullscreen": false,
         "decorations": false,
         "visible": true
+      },
+      {
+        "label": "widget",
+        "title": "SimplePass",
+        "width": 72,
+        "height": 72,
+        "dragDropEnabled": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "decorations": false,
+        "shadow": false,
+        "visible": false
       }
     ],
     "security": {
