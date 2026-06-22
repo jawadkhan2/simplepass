@@ -8,6 +8,7 @@ export interface SetupState {
   startAtLogin: boolean;
   avatar?: string | null;
   floatingIcon?: boolean;
+  autoOpen?: boolean;
   publicKey?: string | null;
 }
 

@@ -887,6 +887,7 @@ function SettingsPanel(props: {
   const [startAtLogin, setStartAtLogin] = useState(props.setup.startAtLogin);
   const [avatar, setAvatar] = useState<string | null>(props.setup.avatar ?? null);
   const [floatingIcon, setFloatingIcon] = useState(props.setup.floatingIcon ?? false);
+  const [autoOpen, setAutoOpen] = useState(props.setup.autoOpen ?? false);
   // Serialize floating-icon toggles: rapid clicks fire overlapping set_floating_icon
   // commands that the backend can complete out of order, so a late show()/hide()
   // wins over the user's final choice. Run one command at a time and always reapply
@@ -955,6 +956,17 @@ function SettingsPanel(props: {
       props.onError(err instanceof Error ? err.message : String(err));
     } finally {
       toggleRunning.current = false;
+    }
+  }
+
+  async function toggleAutoOpen(enabled: boolean) {
+    setAutoOpen(enabled); // optimistic
+    try {
+      const updated = await api.setAutoOpen(enabled);
+      props.onSetup(updated);
+    } catch (err) {
+      setAutoOpen(!enabled); // revert on failure
+      props.onError(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -1028,6 +1040,14 @@ function SettingsPanel(props: {
             onChange={(event) => void toggleFloatingIcon(event.target.checked)}
           />
           Show a floating desktop icon
+        </label>
+        <label className="check-row">
+          <input
+            type="checkbox"
+            checked={autoOpen}
+            onChange={(event) => void toggleAutoOpen(event.target.checked)}
+          />
+          Open received files &amp; links automatically
         </label>
 
         {props.setup.publicKey && (

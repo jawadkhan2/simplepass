@@ -1,6 +1,6 @@
 [package]
 name = "simplepass"
-version = "0.1.2"
+version = "0.1.3"
 description = "AirDrop-style local network sharing for Windows and macOS"
 authors = ["SimplePass"]
 edition = "2021"

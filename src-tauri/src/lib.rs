@@ -13,7 +13,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread,
@@ -22,7 +22,7 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, LogicalPosition, Manager, State, WindowEvent,
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, State, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
 use uuid::Uuid;
@@ -37,6 +37,10 @@ const FILE_CHUNK_SIZE: usize = 64 * 1024;
 /// Largest declared size accepted for an incoming file. Caps a malicious peer's
 /// ability to fill the disk by declaring/streaming an enormous transfer.
 const MAX_INCOMING_FILE_SIZE: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
+/// Largest widget-staged file the sender keeps a durable copy of (in Downloads)
+/// so it can be reopened from chat. Larger staged sends stay transient and carry
+/// no chat path (no Open button), avoiding silent duplication of big files.
+const MAX_SENDER_PERSIST_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
 /// Largest single newline-delimited envelope read off a connection. Bounds
 /// memory so a peer cannot OOM us with a multi-gigabyte line that never ends.
 const MAX_LINE_BYTES: u64 = 1024 * 1024; // 1 MiB
@@ -45,6 +49,48 @@ const MAX_LINE_BYTES: u64 = 1024 * 1024; // 1 MiB
 const MAX_AVATAR_LEN: usize = 256 * 1024; // 256 KiB
 /// Cap on persisted transfer history so `state.json` cannot grow without bound.
 const MAX_PERSISTED_TRANSFERS: usize = 200;
+/// Per-call read/write timeout on a peer TCP connection. A silent or hung peer
+/// can therefore never park a sender or receiver thread indefinitely.
+const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Timeout for the initial dial to a peer. Bounds the wait when a peer's stored
+/// address is stale/unreachable instead of relying on the OS SYN timeout.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Hard cap on concurrent inbound connection-handler threads, so a flood of TCP
+/// connections cannot spawn unbounded threads and exhaust resources.
+const MAX_CONNECTION_THREADS: usize = 128;
+/// Largest peer-supplied device name we store. A discovery packet is untrusted;
+/// without a bound a peer could persist a multi-megabyte name into state.json.
+const MAX_DEVICE_NAME_LEN: usize = 80;
+/// Hard cap on stored peers. A LAN spoofer broadcasting many device ids cannot
+/// grow the peer list (and state.json) without bound; paired peers are never
+/// evicted to make room.
+const MAX_PEERS: usize = 256;
+/// Largest widget-staged file we will assemble on disk. Bounds how much a runaway
+/// or hostile staging stream can write into the temp dir before `send_staged_file`.
+const MAX_STAGED_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+/// Minimum gap between auto-opens of received content. Stops a paired (or spoofed)
+/// peer from forcing a burst of browser tabs / viewer launches ("tab bomb") by
+/// streaming many links or files in quick succession while auto-open is enabled.
+const AUTO_OPEN_MIN_INTERVAL_MS: i64 = 1200;
+
+/// Number of live inbound connection-handler threads. Bounded by
+/// `MAX_CONNECTION_THREADS` in `run_tcp_listener`.
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// File extensions we are willing to auto-open with the OS default handler. This
+/// is an allowlist of inert, viewer-opened media/document types — never a
+/// blocklist — so a type we have not vetted is never auto-launched. Critically it
+/// excludes executables and shell-interpreted types (.exe/.bat/.cmd/.ps1/.msi/
+/// .lnk/.url/.hta/.scr/.js/.vbs/...), an HTML page (script execution), and SVG
+/// (can embed script). Matched case-insensitively.
+const AUTO_OPEN_ALLOWED_EXT: &[&str] = &[
+    // images
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "avif", "ico",
+    // audio / video
+    "mp4", "m4v", "mov", "webm", "mkv", "avi", "mp3", "wav", "flac", "ogg", "m4a", "aac",
+    // documents / text
+    "pdf", "txt", "md", "csv", "log", "rtf", "json", "xml", "yaml", "yml",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +106,10 @@ struct SetupState {
     /// Whether the always-on-top floating desktop icon is shown.
     #[serde(default)]
     floating_icon: bool,
+    /// When set, received files and links are auto-opened with the OS default
+    /// viewer as they arrive (files with no associated handler are skipped).
+    #[serde(default)]
+    auto_open: bool,
     /// Last on-screen position of the floating icon, so it reappears where the
     /// user left it across launches.
     #[serde(default)]
@@ -78,6 +128,8 @@ struct SetupResponse {
     avatar: Option<String>,
     #[serde(default)]
     floating_icon: bool,
+    #[serde(default)]
+    auto_open: bool,
     /// Our own X25519 public key (base64), so the UI can show a verification
     /// fingerprint the user can read out-of-band when approving a pairing.
     public_key: Option<String>,
@@ -183,6 +235,7 @@ impl Default for PersistedState {
                 start_at_login: true,
                 avatar: None,
                 floating_icon: false,
+                auto_open: false,
                 widget_x: None,
                 widget_y: None,
             },
@@ -234,10 +287,16 @@ enum TransportEnvelope {
 struct AppState {
     path: PathBuf,
     inner: Mutex<PersistedState>,
-    incoming_files: Mutex<HashMap<String, IncomingFile>>,
+    /// In-progress incoming transfers, keyed by transfer_id. Each entry is behind
+    /// its own `Mutex` so a chunk write holds only that transfer's lock — the map
+    /// lock is taken just long enough to clone the `Arc`, never across disk I/O.
+    incoming_files: Mutex<HashMap<String, Arc<Mutex<IncomingFile>>>>,
     /// Per-transfer cancel flags, keyed by transfer_id. Set by `cancel_file_send`,
     /// polled by the streaming thread in `send_files`.
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Timestamp (ms) of the last auto-open, used to rate-limit auto-opening of
+    /// received files/links. See `auto_open_rate_ok`.
+    last_auto_open: Mutex<i64>,
 }
 
 /// One open TCP connection to a target peer for an in-flight outgoing file.
@@ -287,6 +346,7 @@ fn save_setup(
         start_at_login,
         avatar: existing.avatar.clone(),
         floating_icon: existing.floating_icon,
+        auto_open: existing.auto_open,
         widget_x: existing.widget_x,
         widget_y: existing.widget_y,
     };
@@ -510,17 +570,25 @@ fn receive_message(app: &AppHandle, state: &State<AppState>, peer_id: String, te
 
 // Records a link received from a paired peer. Internal only (called from
 // `handle_message`), not a Tauri command — the frontend never injects links.
-// The link is *not* auto-opened: a malicious/spoofed peer must not be able to
-// force-open arbitrary URLs. Non-http(s) links are dropped entirely. The user
-// opens a recorded link by clicking its bubble (`open_link`).
+// Non-http(s) links are always dropped. By default the link is *not* auto-opened
+// (the user opens it by clicking its bubble via `open_link`); only when the user
+// has explicitly enabled the auto-open toggle do we hand the validated http(s)
+// URL to the OS opener as it arrives.
 fn receive_link(app: &AppHandle, state: &State<AppState>, peer_id: String, url: String) -> AppResult<()> {
     ensure_paired(state, &peer_id)?;
     if !is_http_url(&url) {
         return Ok(());
     }
+    let auto = auto_open_enabled(state)?;
     let mut message = make_chat_message(peer_id, "received", "link", url.clone());
-    message.url = Some(url);
-    record_chat_message(app, state, message)
+    message.url = Some(url.clone());
+    record_chat_message(app, state, message)?;
+    // Rate-limit auto-open so a peer streaming many links can't spawn a burst of
+    // browser tabs. Links that exceed the rate are still recorded in chat.
+    if auto && auto_open_rate_ok(state) {
+        let _ = open_url(&url);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -674,7 +742,7 @@ fn send_one_file(
     // Open one connection per target and announce the file.
     let mut conns: Vec<PeerConn> = Vec::new();
     for (peer, secret) in targets {
-        match TcpStream::connect((peer.host.as_str(), peer.port)) {
+        match dial_peer(peer.host.as_str(), peer.port) {
             Ok(mut stream) => {
                 let started = write_encrypted_line(
                     &mut stream,
@@ -901,13 +969,40 @@ fn stage_file_chunk(session_id: String, data: String) -> AppResult<()> {
         .open(&path)
         .map_err(|err| err.to_string())?;
     file.write_all(&bytes).map_err(|err| err.to_string())?;
+    // Cap the assembled size so a runaway or hostile staging stream can't fill the
+    // temp dir. On overflow, delete the partial file and abort the staging session.
+    let size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    if size > MAX_STAGED_FILE_SIZE {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err("The staged file is too large.".to_string());
+    }
     Ok(())
 }
 
+/// Remove widget staging temp files orphaned by a previous run. A staged file is
+/// only meaningful within the session that produced it (the frontend's in-memory
+/// session id is gone after a restart), so any `simplepass-stage-*` file present
+/// at startup is dead and safe to delete. Best-effort.
+fn cleanup_stale_staged_files() {
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if name.starts_with("simplepass-stage-") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 /// Send a file previously assembled by `stage_file_chunk` to the given peers under
-/// its original name, then delete the temp file. Reuses the same chunked, cancelable
-/// streaming path as `send_files`; the local chat record carries no file path since
-/// the staged copy is transient.
+/// its original name. Reuses the same chunked, cancelable streaming path as
+/// `send_files`. Small staged files (<= `MAX_SENDER_PERSIST_BYTES`) are first
+/// copied into the sender's Downloads so the sender can reopen them from chat
+/// (the chat record carries that path); larger ones stay transient and carry no
+/// chat path. The temp staging file is always removed afterward.
 #[tauri::command]
 fn send_staged_file(
     app: AppHandle,
@@ -949,11 +1044,41 @@ fn send_staged_file(
         file_name
     };
     thread::spawn(move || {
-        let path = staged.to_string_lossy().to_string();
-        send_one_file(&app, &local_id, &targets, &path, Some(&name), None);
+        // Keep a durable copy in Downloads for small files so the sender's chat
+        // record points at something openable; large files stay transient.
+        let persisted = persist_staged_copy(&staged, &name);
+        let send_path = persisted
+            .as_ref()
+            .map(|dest| dest.to_string_lossy().to_string())
+            .unwrap_or_else(|| staged.to_string_lossy().to_string());
+        let record_path = persisted
+            .as_ref()
+            .map(|dest| dest.to_string_lossy().to_string());
+        send_one_file(&app, &local_id, &targets, &send_path, Some(&name), record_path.as_deref());
         let _ = fs::remove_file(&staged);
     });
     Ok(())
+}
+
+/// Copy a staged temp file into the sender's Downloads under a non-colliding
+/// name and return that path, so the sender can open it from chat. Returns
+/// `None` (file stays transient, no chat path / no Open button) when the file
+/// exceeds `MAX_SENDER_PERSIST_BYTES` or persistence fails for any reason.
+fn persist_staged_copy(staged: &Path, file_name: &str) -> Option<PathBuf> {
+    let size = fs::metadata(staged).ok()?.len();
+    if size > MAX_SENDER_PERSIST_BYTES {
+        return None;
+    }
+    let downloads = dirs::download_dir()?;
+    // Reserves + creates an empty destination; the copy below overwrites it.
+    let dest = available_destination(&downloads, file_name).ok()?;
+    match fs::copy(staged, &dest) {
+        Ok(_) => Some(dest),
+        Err(_) => {
+            let _ = fs::remove_file(&dest); // drop the empty reserved file
+            None
+        }
+    }
 }
 
 #[tauri::command]
@@ -979,6 +1104,54 @@ fn clear_transfers(state: State<AppState>) -> AppResult<()> {
     let mut persisted = state.inner.lock().map_err(lock_err)?;
     persisted.transfers.clear();
     save_state(&state.path, &persisted)
+}
+
+/// Whether the user has opted into auto-opening received files/links.
+fn auto_open_enabled(state: &State<AppState>) -> AppResult<bool> {
+    Ok(state.inner.lock().map_err(lock_err)?.setup.auto_open)
+}
+
+/// Throttle auto-opens. Returns `true` (and records "now") only if at least
+/// `AUTO_OPEN_MIN_INTERVAL_MS` has elapsed since the previous auto-open, so a
+/// peer cannot trigger a flood of viewer/browser launches by streaming many
+/// files or links in quick succession. On a poisoned lock we deny (return false).
+fn auto_open_rate_ok(state: &State<AppState>) -> bool {
+    let mut last = match state.last_auto_open.lock() {
+        Ok(guard) => guard,
+        Err(_) => return false,
+    };
+    let now = now_ms();
+    if now - *last >= AUTO_OPEN_MIN_INTERVAL_MS {
+        *last = now;
+        true
+    } else {
+        false
+    }
+}
+
+/// Whether a received file is safe to auto-open. Only files whose extension is in
+/// the inert-viewer allowlist (`AUTO_OPEN_ALLOWED_EXT`) qualify; everything else —
+/// notably executables, scripts, installers, shortcuts (.lnk/.url), .hta, .html,
+/// and extensionless files — is excluded so auto-open can never launch code.
+fn is_safe_to_auto_open(path: &std::path::Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => AUTO_OPEN_ALLOWED_EXT.contains(&ext.to_ascii_lowercase().as_str()),
+        None => false,
+    }
+}
+
+/// Best-effort auto-open of a freshly received file with its default viewer.
+///
+/// Gated by an extension allowlist (`is_safe_to_auto_open`): handing an
+/// attacker-supplied path to the OS shell would otherwise be remote code
+/// execution (a paired/spoofed peer could send `invoice.exe`, a `.lnk`, a `.bat`,
+/// etc. and have it launched on receipt). `open::that_detached` returns an error
+/// (no "Open with" picker) when an allowlisted type has no associated handler, so
+/// unviewable-but-safe files are silently skipped — which is what the toggle promises.
+fn auto_open_received_file(path: &std::path::Path) {
+    if is_safe_to_auto_open(path) {
+        let _ = open::that_detached(path);
+    }
 }
 
 #[tauri::command]
@@ -1043,15 +1216,26 @@ pub fn run() {
                 persisted.setup.widget_x,
                 persisted.setup.widget_y,
             );
+            // Remove any widget staging temp files orphaned by a previous run.
+            cleanup_stale_staged_files();
             app.manage(AppState {
                 path,
                 inner: Mutex::new(persisted),
                 incoming_files: Mutex::new(HashMap::new()),
                 cancels: Mutex::new(HashMap::new()),
+                last_auto_open: Mutex::new(0),
             });
             build_tray(app.handle())?;
             if widget.0 {
-                let _ = open_widget_window(app.handle(), widget.1, widget.2);
+                // Centre on launch too (per request), with the same radar pulse.
+                let _ = open_widget_window(app.handle(), widget.1, widget.2, true);
+                // The widget webview is still loading, so its reveal listener is
+                // not ready yet; emit after a short delay so the radar fires.
+                let radar_handle = app.handle().clone();
+                thread::spawn(move || {
+                    thread::sleep(std::time::Duration::from_millis(1500));
+                    let _ = radar_handle.emit_to(WIDGET_LABEL, "widget-reveal", ());
+                });
             }
             keep_widget_on_top(app.handle());
             start_transport(app.handle().clone());
@@ -1090,6 +1274,8 @@ pub fn run() {
             open_link,
             show_window,
             set_floating_icon,
+            set_auto_open,
+            collapse_widget,
             save_widget_position
         ])
         .run(tauri::generate_context!())
@@ -1115,15 +1301,26 @@ fn run_tcp_listener(app: AppHandle) {
         }
     };
     for stream in listener.incoming().flatten() {
+        // Bound concurrent handler threads so a connection flood can't spawn
+        // unbounded threads. Over the cap, drop the socket (closes on drop).
+        if ACTIVE_CONNECTIONS.load(Ordering::Relaxed) >= MAX_CONNECTION_THREADS {
+            continue;
+        }
+        ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         let app = app.clone();
         thread::spawn(move || {
             let _ = handle_stream(app, stream);
+            ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
 
 fn handle_stream(app: AppHandle, stream: TcpStream) -> AppResult<()> {
     let remote_addr = stream.peer_addr().ok();
+    // Bound per-read/-write waits so a peer that connects then stalls (or vanishes
+    // mid-transfer) can't pin this handler thread forever.
+    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let mut reader = BufReader::new(stream);
     // A single connection may carry multiple newline-delimited envelopes (notably
     // for chunked file transfers). Processing them on one thread keeps chunks in order.
@@ -1309,6 +1506,8 @@ fn upsert_peer_from_addr(
     addr: SocketAddr,
 ) -> AppResult<()> {
     let host = addr.ip().to_string();
+    // Discovery packets are untrusted; bound the name before it is persisted.
+    packet.device_name = clamp_device_name(&packet.device_name);
     let peers = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
         match persisted.peers.iter_mut().find(|peer| peer.id == packet.device_id) {
@@ -1336,6 +1535,7 @@ fn upsert_peer_from_addr(
             }),
         }
         prune_offline_host_duplicates(&mut persisted, &packet.device_id, &host);
+        enforce_peer_cap(&mut persisted);
         let peers = persisted.peers.clone();
         save_state(&state.path, &persisted)?;
         peers
@@ -1362,18 +1562,60 @@ fn mark_stale_peers_offline(app: &AppHandle, state: &State<AppState>, now: i64) 
     Ok(())
 }
 
+/// Bound an untrusted, peer-supplied device name: trim, cap to
+/// `MAX_DEVICE_NAME_LEN` characters (by `char`, not bytes, so multi-byte names are
+/// never split mid-codepoint), and substitute a placeholder when empty. Prevents a
+/// discovery packet from persisting an unbounded string into `state.json`.
+fn clamp_device_name(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return "Unknown device".to_string();
+    }
+    trimmed.chars().take(MAX_DEVICE_NAME_LEN).collect()
+}
+
+/// Bound the stored peer list to `MAX_PEERS`. A LAN spoofer broadcasting many
+/// device ids must not be able to grow the list (and `state.json`) without bound.
+/// Paired peers are never evicted; the stalest *unpaired* peers (oldest
+/// `last_seen` first) are dropped until under the cap, stopping if only paired
+/// peers remain.
+fn enforce_peer_cap(state: &mut PersistedState) {
+    while state.peers.len() > MAX_PEERS {
+        let victim = state
+            .peers
+            .iter()
+            .enumerate()
+            .filter(|(_, peer)| peer.trust_state != "paired")
+            .min_by_key(|(_, peer)| peer.last_seen)
+            .map(|(index, _)| index);
+        match victim {
+            Some(index) => {
+                state.peers.remove(index);
+            }
+            None => break,
+        }
+    }
+}
+
 /// Drops stale duplicate identities of the same physical machine. On a LAN each
 /// device owns one IP, so an *offline* peer sharing `host` with a different,
 /// currently-seen `keep_id` is a dead prior identity (e.g. the peer reinstalled
 /// and regenerated its device id). Returns whether anything was removed.
+///
+/// Paired peers are never pruned: a paired identity carries the shared secret and
+/// trust the user explicitly established, and IPs are reassigned by DHCP, so a
+/// transient address collision must not silently delete a trusted peer.
 fn prune_offline_host_duplicates(state: &mut PersistedState, keep_id: &str, host: &str) -> bool {
     if host.trim().is_empty() {
         return false;
     }
     let before = state.peers.len();
-    state
-        .peers
-        .retain(|peer| !(peer.id != keep_id && peer.host == host && peer.status == "offline"));
+    state.peers.retain(|peer| {
+        !(peer.id != keep_id
+            && peer.host == host
+            && peer.status == "offline"
+            && peer.trust_state != "paired")
+    });
     state.peers.len() != before
 }
 
@@ -1391,12 +1633,14 @@ fn apply_stale_peer_status(state: &mut PersistedState, now: i64) -> bool {
 fn upsert_discovered_peer(
     app: &AppHandle,
     state: &State<AppState>,
-    packet: DiscoveryPacket,
+    mut packet: DiscoveryPacket,
     trust_state: &str,
     remote_addr: Option<SocketAddr>,
     shared_secret: Option<String>,
 ) -> AppResult<PeerDevice> {
     let host = remote_addr.map(|addr| addr.ip().to_string()).unwrap_or_default();
+    // Untrusted packet; bound the name before it is persisted.
+    packet.device_name = clamp_device_name(&packet.device_name);
     let (peers, changed_peer) = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
         let changed_peer = match persisted.peers.iter_mut().find(|peer| peer.id == packet.device_id) {
@@ -1434,6 +1678,7 @@ fn upsert_discovered_peer(
                 persisted.peers.last().cloned().ok_or_else(|| "Peer not found.".to_string())?
             }
         };
+        enforce_peer_cap(&mut persisted);
         let peers = persisted.peers.clone();
         save_state(&state.path, &persisted)?;
         (peers, changed_peer)
@@ -1442,11 +1687,26 @@ fn upsert_discovered_peer(
     Ok(changed_peer)
 }
 
+/// Dial a peer with a bounded connect timeout, then arm read/write timeouts on
+/// the socket so neither the connect nor any later send can block this thread
+/// indefinitely against a stale address or a peer that stalls mid-write.
+fn dial_peer(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    use std::net::ToSocketAddrs;
+    let addr = (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address for peer"))?;
+    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(stream)
+}
+
 fn send_plain_wire(peer: &PeerDevice, message: WireMessage) -> AppResult<()> {
     if peer.host.trim().is_empty() {
         return Err(format!("{} does not have a network address yet.", peer.name));
     }
-    let mut stream = TcpStream::connect((peer.host.as_str(), peer.port)).map_err(|err| err.to_string())?;
+    let mut stream = dial_peer(peer.host.as_str(), peer.port).map_err(|err| err.to_string())?;
     let body = serde_json::to_string(&TransportEnvelope::Plain { message }).map_err(|err| err.to_string())?;
     stream.write_all(body.as_bytes()).map_err(|err| err.to_string())?;
     stream.write_all(b"\n").map_err(|err| err.to_string())
@@ -1461,7 +1721,7 @@ fn send_wire(peer: &PeerDevice, message: WireMessage) -> AppResult<()> {
         .as_deref()
         .ok_or_else(|| format!("{} does not have a shared secret yet.", peer.name))?;
     let peer_id = envelope_peer_id(&message)?.to_string();
-    let mut stream = TcpStream::connect((peer.host.as_str(), peer.port)).map_err(|err| err.to_string())?;
+    let mut stream = dial_peer(peer.host.as_str(), peer.port).map_err(|err| err.to_string())?;
     write_encrypted_line(&mut stream, &peer_id, secret, &message)?;
     stream.flush().map_err(|err| err.to_string())
 }
@@ -1518,6 +1778,7 @@ fn setup_response(setup: &SetupState) -> SetupResponse {
         start_at_login: setup.start_at_login,
         avatar: setup.avatar.clone(),
         floating_icon: setup.floating_icon,
+        auto_open: setup.auto_open,
         public_key: derive_public_key(&setup.identity_secret).ok(),
     }
 }
@@ -1752,6 +2013,16 @@ fn show_window(app: AppHandle) -> AppResult<()> {
 
 const WIDGET_LABEL: &str = "widget";
 
+/// Square (logical px) the widget grows to while the radar pulse plays, so the
+/// expanding rings have room. Must match `RADAR_SIZE` in `FloatingIcon.tsx`: the
+/// window is sized to this *before* it is shown so it appears already centred at
+/// full size, and the frontend collapses it back to the resting icon afterwards.
+const WIDGET_RADAR_SIZE: f64 = 220.0;
+
+/// Resting size (logical px) of the widget once the radar pulse is done. Must
+/// match `IDLE_SIZE` in `FloatingIcon.tsx`.
+const WIDGET_IDLE_SIZE: f64 = 72.0;
+
 /// Reveal the always-on-top floating desktop icon. The widget is a window declared
 /// in `tauri.conf.json` (hidden at launch) rather than one built here at runtime:
 /// it must have `dragDropEnabled: false` so the webview receives HTML5 drag-drop
@@ -1759,14 +2030,32 @@ const WIDGET_LABEL: &str = "widget";
 /// config — `WebviewWindowBuilder::drag_and_drop(false)` is silently ignored on
 /// Windows (tauri-apps/tauri#13761). `main.tsx` renders `<FloatingIcon>` for the
 /// `widget` label instead of the full app.
-fn open_widget_window(app: &AppHandle, x: Option<f64>, y: Option<f64>) -> AppResult<()> {
+///
+/// `center: true` ignores the saved position and parks the widget in the middle of
+/// the current screen (used when the user first enables it, so it always appears
+/// somewhere visible). Otherwise the last saved position is restored. Saved
+/// coordinates come from the JS `onMoved` event, which reports *physical* pixels,
+/// so they must be restored as `PhysicalPosition` — restoring them as logical
+/// scaled them by the display factor on HiDPI screens and shoved the widget
+/// off-screen, which is why it "stopped showing up".
+fn open_widget_window(app: &AppHandle, x: Option<f64>, y: Option<f64>, center: bool) -> AppResult<()> {
     let window = app
         .get_webview_window(WIDGET_LABEL)
         .ok_or_else(|| "Floating widget window is unavailable.".to_string())?;
-    if let (Some(x), Some(y)) = (x, y) {
-        let _ = window.set_position(LogicalPosition::new(x, y));
+    if center {
+        // Size to the full radar square first, then centre, so the widget appears
+        // already centred at its final size — no grow-then-recentre jump.
+        let _ = window.set_size(LogicalSize::new(WIDGET_RADAR_SIZE, WIDGET_RADAR_SIZE));
+        let _ = window.center();
+    } else if let (Some(x), Some(y)) = (x, y) {
+        let _ = window.set_position(PhysicalPosition::new(x, y));
     }
     window.show().map_err(|err| err.to_string())?;
+    // center() before show() can resolve against the wrong monitor on some
+    // platforms, so re-center once the window is realised.
+    if center {
+        let _ = window.center();
+    }
     // Re-assert topmost on every reveal: the config flag is set once at creation,
     // but Windows drops a window's topmost z-order when another app claims it
     // (fullscreen apps, explorer.exe restarts), so it must be re-applied.
@@ -1804,23 +2093,51 @@ fn close_widget_window(app: &AppHandle) {
 /// Toggle the floating desktop icon on/off and persist the preference.
 #[tauri::command]
 fn set_floating_icon(app: AppHandle, state: State<AppState>, enabled: bool) -> AppResult<SetupResponse> {
-    let (response, x, y) = {
+    let response = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
         persisted.setup.floating_icon = enabled;
         save_state(&state.path, &persisted)?;
-        (
-            setup_response(&persisted.setup),
-            persisted.setup.widget_x,
-            persisted.setup.widget_y,
-        )
+        setup_response(&persisted.setup)
     };
     if enabled {
-        open_widget_window(&app, x, y)?;
+        // Explicit enable always centers the widget on screen, so it can never
+        // reappear off-screen from a stale saved position.
+        open_widget_window(&app, None, None, true)?;
+        // Tell the widget webview to play the radar pulse that guides the user's
+        // eye to the screen centre where it just appeared.
+        let _ = app.emit_to(WIDGET_LABEL, "widget-reveal", ());
     } else {
         close_widget_window(&app);
     }
     let _ = app.emit("setup-changed", response.clone());
     Ok(response)
+}
+
+/// Toggle whether incoming files/links are auto-opened with the OS default
+/// viewer as they arrive. Off by default; files with no associated handler are
+/// skipped (see `auto_open_received_file`).
+#[tauri::command]
+fn set_auto_open(app: AppHandle, state: State<AppState>, enabled: bool) -> AppResult<SetupResponse> {
+    let response = {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        persisted.setup.auto_open = enabled;
+        save_state(&state.path, &persisted)?;
+        setup_response(&persisted.setup)
+    };
+    let _ = app.emit("setup-changed", response.clone());
+    Ok(response)
+}
+
+/// Collapse the widget from its radar square back to the resting icon, keeping it
+/// centred. Done in Rust because a JS `center()` right after a resize races the
+/// resize and leaves the icon offset (up-left) instead of centred.
+#[tauri::command]
+fn collapse_widget(app: AppHandle) -> AppResult<()> {
+    if let Some(win) = app.get_webview_window(WIDGET_LABEL) {
+        let _ = win.set_size(LogicalSize::new(WIDGET_IDLE_SIZE, WIDGET_IDLE_SIZE));
+        let _ = win.center();
+    }
+    Ok(())
 }
 
 /// Persist where the user dragged the floating icon, so it returns there next time.
@@ -1909,6 +2226,9 @@ fn receive_file_start(
     if total_size > MAX_INCOMING_FILE_SIZE {
         return Err("The incoming file is too large.".to_string());
     }
+    // Peer-controlled; reduce to a bare base name so the label we display and the
+    // path we write to agree, and neither can carry directory components.
+    let file_name = sanitize_file_name(&file_name);
     let peer_name = get_peer(state, &peer_id)
         .map(|peer| peer.name)
         .unwrap_or_else(|_| "Unknown device".to_string());
@@ -1916,9 +2236,9 @@ fn receive_file_start(
     // Atomically reserves + creates the empty destination so chunks can be
     // appended in order and concurrent transfers can't collide on one path.
     let destination =
-        available_destination(&downloads, std::ffi::OsStr::new(&file_name)).map_err(|err| err.to_string())?;
+        available_destination(&downloads, &file_name).map_err(|err| err.to_string())?;
     // Keep one append handle open for the whole transfer (chunks are written under
-    // the incoming_files lock, in order, on the connection's single thread).
+    // the per-transfer lock, in order, on the connection's single thread).
     let file = fs::OpenOptions::new()
         .append(true)
         .open(&destination)
@@ -1928,14 +2248,14 @@ fn receive_file_start(
         let mut incoming = state.incoming_files.lock().map_err(lock_err)?;
         incoming.insert(
             transfer_id.clone(),
-            IncomingFile {
+            Arc::new(Mutex::new(IncomingFile {
                 path: destination,
                 file,
                 expected_size: total_size,
                 received_size: 0,
                 peer_name: peer_name.clone(),
                 file_name: file_name.clone(),
-            },
+            })),
         );
     }
 
@@ -1963,26 +2283,41 @@ fn receive_file_chunk(
 ) -> AppResult<()> {
     ensure_paired(state, &peer_id)?;
     let bytes = BASE64.decode(data).map_err(|err| err.to_string())?;
-    let (progress, peer_name, file_name) = {
-        let mut incoming = state.incoming_files.lock().map_err(lock_err)?;
-        let entry = incoming
-            .get_mut(&transfer_id)
-            .ok_or_else(|| "Received a chunk for an unknown transfer.".to_string())?;
+    // Take the map lock only long enough to clone the per-transfer handle, so the
+    // disk write below holds just this transfer's lock — never the shared map lock.
+    let entry_arc = {
+        let incoming = state.incoming_files.lock().map_err(lock_err)?;
+        incoming.get(&transfer_id).cloned()
+    }
+    .ok_or_else(|| "Received a chunk for an unknown transfer.".to_string())?;
+
+    let outcome: Result<(u8, String, String), PathBuf> = {
+        let mut entry = entry_arc.lock().map_err(lock_err)?;
         // Refuse to write past the size the sender declared in FileStart. Stops a
         // peer from streaming unbounded data into the Downloads folder. Abort the
         // transfer and remove the partial file.
         if entry.received_size + bytes.len() as u64 > entry.expected_size {
-            let path = entry.path.clone();
+            Err(entry.path.clone())
+        } else {
+            entry.file.write_all(&bytes).map_err(|err| err.to_string())?;
+            entry.received_size += bytes.len() as u64;
+            let progress = (((entry.received_size as f64) / (entry.expected_size.max(1) as f64))
+                * 100.0)
+                .round()
+                .min(100.0) as u8;
+            Ok((progress, entry.peer_name.clone(), entry.file_name.clone()))
+        }
+    };
+
+    let (progress, peer_name, file_name) = match outcome {
+        Ok(values) => values,
+        Err(path) => {
+            let mut incoming = state.incoming_files.lock().map_err(lock_err)?;
             incoming.remove(&transfer_id);
+            drop(incoming);
             let _ = fs::remove_file(&path);
             return Err("Incoming file exceeded its declared size.".to_string());
         }
-        entry.file.write_all(&bytes).map_err(|err| err.to_string())?;
-        entry.received_size += bytes.len() as u64;
-        let progress = (((entry.received_size as f64) / (entry.expected_size.max(1) as f64)) * 100.0)
-            .round()
-            .min(100.0) as u8;
-        (progress, entry.peer_name.clone(), entry.file_name.clone())
     };
 
     emit_transfer(
@@ -2007,16 +2342,28 @@ fn receive_file_end(
     transfer_id: String,
 ) -> AppResult<()> {
     ensure_paired(state, &peer_id)?;
-    let entry = {
+    let entry_arc = {
         let mut incoming = state.incoming_files.lock().map_err(lock_err)?;
         incoming.remove(&transfer_id)
     };
-    let entry = entry.ok_or_else(|| "Received an end marker for an unknown transfer.".to_string())?;
+    let entry_arc =
+        entry_arc.ok_or_else(|| "Received an end marker for an unknown transfer.".to_string())?;
+    // We hold the only remaining `Arc`; copy out what we need, then drop the guard
+    // (and with it the append handle, flushing/closing the file) before continuing.
+    let (path, file_name, expected_size, peer_name) = {
+        let entry = entry_arc.lock().map_err(lock_err)?;
+        (
+            entry.path.clone(),
+            entry.file_name.clone(),
+            entry.expected_size,
+            entry.peer_name.clone(),
+        )
+    };
 
-    let mut message = make_chat_message(peer_id.clone(), "received", "file", entry.file_name.clone());
-    message.file_name = Some(entry.file_name.clone());
-    message.file_size = Some(entry.expected_size);
-    message.file_path = Some(entry.path.to_string_lossy().to_string());
+    let mut message = make_chat_message(peer_id.clone(), "received", "file", file_name.clone());
+    message.file_name = Some(file_name.clone());
+    message.file_size = Some(expected_size);
+    message.file_path = Some(path.to_string_lossy().to_string());
     record_chat_message(app, state, message)?;
 
     {
@@ -2024,8 +2371,8 @@ fn receive_file_end(
         persisted.transfers.push(TransferProgress {
             id: transfer_id.clone(),
             peer_id: peer_id.clone(),
-            peer_name: entry.peer_name.clone(),
-            label: entry.file_name.clone(),
+            peer_name: peer_name.clone(),
+            label: file_name.clone(),
             kind: "file".to_string(),
             progress: 100,
             state: "complete".to_string(),
@@ -2035,17 +2382,23 @@ fn receive_file_end(
         save_state(&state.path, &persisted)?;
     }
 
-    // Received files are *not* auto-opened: a paired (or spoofed) peer must not be
-    // able to launch an executable/handler on this machine. The file sits in
-    // Downloads and the chat record is clickable when the user wants to open it.
+    // By default received files are *not* auto-opened: a paired (or spoofed) peer
+    // must not silently launch a handler on this machine. The file sits in
+    // Downloads and the chat record is clickable. Only when the user has opted
+    // into auto-open do we hand it to the default viewer — and even then only for
+    // an allowlisted, inert file type (see `auto_open_received_file`) and subject
+    // to a rate limit, so a burst of files can't launch a burst of viewers.
+    if auto_open_enabled(state)? && auto_open_rate_ok(state) {
+        auto_open_received_file(&path);
+    }
 
     emit_transfer(
         app,
         TransferProgress {
             id: transfer_id,
             peer_id,
-            peer_name: entry.peer_name,
-            label: entry.file_name,
+            peer_name,
+            label: file_name,
             kind: "file".to_string(),
             progress: 100,
             state: "complete".to_string(),
@@ -2063,24 +2416,32 @@ fn receive_file_cancel(
     transfer_id: String,
 ) -> AppResult<()> {
     ensure_paired(state, &peer_id)?;
-    let entry = {
+    let entry_arc = {
         let mut incoming = state.incoming_files.lock().map_err(lock_err)?;
         incoming.remove(&transfer_id)
     };
     // Nothing reserved (e.g. cancel arrived before FileStart) — nothing to clean up.
-    let Some(entry) = entry else {
+    let Some(entry_arc) = entry_arc else {
         return Ok(());
     };
+    let (path, file_name, peer_name) = {
+        let entry = entry_arc.lock().map_err(lock_err)?;
+        (
+            entry.path.clone(),
+            entry.file_name.clone(),
+            entry.peer_name.clone(),
+        )
+    };
 
-    let _ = fs::remove_file(&entry.path);
+    let _ = fs::remove_file(&path);
 
     emit_transfer(
         app,
         TransferProgress {
             id: transfer_id,
             peer_id,
-            peer_name: entry.peer_name,
-            label: entry.file_name,
+            peer_name,
+            label: file_name,
             kind: "file".to_string(),
             progress: 0,
             state: "cancelled".to_string(),
@@ -2089,19 +2450,46 @@ fn receive_file_cancel(
     )
 }
 
+/// Reduce a peer-supplied file name to a single, safe path component.
+///
+/// A received name is fully attacker-controlled. Passed straight to `Path::join`
+/// it is a write-anywhere primitive: `..\..` walks out of Downloads, and an
+/// absolute path (`C:\Windows\...`, `/etc/...`) or UNC path (`\\host\share`)
+/// *replaces* the join base entirely. We therefore split on both `/` and `\`
+/// (a backslash is not a separator on Unix, so `Path::file_name` alone would miss
+/// it there), keep only the final segment, and reject the empty/`.`/`..` cases —
+/// falling back to a fixed name. The result is guaranteed to contain no path
+/// separators, so the subsequent `downloads.join(..)` stays inside `downloads`.
+fn sanitize_file_name(file_name: &str) -> String {
+    let last = file_name
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if last.is_empty() || last == "." || last == ".." {
+        "received-file".to_string()
+    } else {
+        last.to_string()
+    }
+}
+
 /// Reserve a unique destination in `downloads`, creating the (empty) file
 /// atomically with `create_new` so two concurrent transfers can never claim the
 /// same path. Without this, a plain `exists()` check is a TOCTOU race: both
 /// transfers see "no file", pick the same name, and interleave chunks into one
 /// corrupt file.
-fn available_destination(downloads: &Path, file_name: &std::ffi::OsStr) -> std::io::Result<PathBuf> {
-    let original = Path::new(file_name);
+fn available_destination(downloads: &Path, file_name: &str) -> std::io::Result<PathBuf> {
+    // The name is peer-controlled. Reduce it to a bare file name first so a
+    // hostile value (`..\..\Startup\evil.bat`, an absolute `C:\...` path, a UNC
+    // share) can never escape `downloads` once joined. See `sanitize_file_name`.
+    let safe = sanitize_file_name(file_name);
+    let original = Path::new(&safe);
     let stem = original
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("file");
     let extension = original.extension().and_then(|value| value.to_str());
-    let mut candidate = downloads.join(file_name);
+    let mut candidate = downloads.join(&safe);
     let mut counter = 1;
 
     loop {
@@ -2270,7 +2658,7 @@ mod tests {
         fs::write(temp_dir.join("report.pdf"), b"first").expect("seed file");
 
         let destination =
-            available_destination(&temp_dir, std::ffi::OsStr::new("report.pdf")).expect("destination");
+            available_destination(&temp_dir, "report.pdf").expect("destination");
 
         assert_eq!(destination.file_name().and_then(|name| name.to_str()), Some("report (1).pdf"));
         fs::remove_dir_all(temp_dir).expect("cleanup");
@@ -2371,5 +2759,96 @@ mod tests {
 
         assert!(!removed);
         assert_eq!(state.peers.len(), 3);
+    }
+
+    #[test]
+    fn prune_never_drops_paired_peer() {
+        let mut state = PersistedState::default();
+        let mut paired = peer_at("paired-old", "192.168.1.67", "offline");
+        paired.trust_state = "paired".to_string();
+        state.peers.push(paired);
+        state.peers.push(peer_at("new", "192.168.1.67", "online"));
+
+        let removed = prune_offline_host_duplicates(&mut state, "new", "192.168.1.67");
+
+        assert!(!removed);
+        assert_eq!(state.peers.len(), 2);
+        assert!(state.peers.iter().any(|peer| peer.id == "paired-old"));
+    }
+
+    #[test]
+    fn sanitize_file_name_strips_path_components() {
+        // Traversal and absolute/UNC paths collapse to a bare component.
+        assert_eq!(sanitize_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_file_name(r"..\..\Startup\evil.bat"), "evil.bat");
+        assert_eq!(sanitize_file_name(r"C:\Windows\system32\calc.exe"), "calc.exe");
+        assert_eq!(sanitize_file_name(r"\\attacker\share\x.txt"), "x.txt");
+        assert_eq!(sanitize_file_name("plain.pdf"), "plain.pdf");
+        // Degenerate names fall back to a fixed safe name.
+        assert_eq!(sanitize_file_name(".."), "received-file");
+        assert_eq!(sanitize_file_name(""), "received-file");
+        assert_eq!(sanitize_file_name("   "), "received-file");
+        // A dotfile keeps its leading dot.
+        assert_eq!(sanitize_file_name(".gitignore"), ".gitignore");
+    }
+
+    #[test]
+    fn available_destination_never_escapes_downloads() {
+        let temp_dir = std::env::temp_dir().join(format!("simplepass-trav-{}", now_ms()));
+        fs::create_dir_all(&temp_dir).expect("temp dir");
+        let dest = available_destination(&temp_dir, "../../escape.txt").expect("destination");
+        assert_eq!(dest.parent(), Some(temp_dir.as_path()));
+        assert_eq!(dest.file_name().and_then(|n| n.to_str()), Some("escape.txt"));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn auto_open_allowlist_excludes_executables() {
+        use std::path::Path;
+        // Inert, viewer-opened types are allowed.
+        assert!(is_safe_to_auto_open(Path::new("photo.PNG")));
+        assert!(is_safe_to_auto_open(Path::new("notes.txt")));
+        assert!(is_safe_to_auto_open(Path::new("doc.pdf")));
+        // Executables / scripts / shortcuts / markup are never auto-opened.
+        for unsafe_name in [
+            "invoice.exe", "run.bat", "go.cmd", "x.ps1", "setup.msi", "link.lnk",
+            "site.url", "page.hta", "index.html", "vector.svg", "macro.docm", "noext",
+        ] {
+            assert!(
+                !is_safe_to_auto_open(Path::new(unsafe_name)),
+                "{unsafe_name} must not be auto-openable"
+            );
+        }
+    }
+
+    #[test]
+    fn enforce_peer_cap_drops_stalest_unpaired_first() {
+        let mut state = PersistedState::default();
+        // One paired peer that must survive, plus MAX_PEERS unpaired ones.
+        let mut paired = peer_at("keep-paired", "10.0.0.1", "offline");
+        paired.trust_state = "paired".to_string();
+        paired.last_seen = 0; // stalest of all, yet must not be evicted
+        state.peers.push(paired);
+        for index in 0..MAX_PEERS {
+            let mut peer = peer_at(&format!("u{index}"), "10.0.0.2", "online");
+            peer.last_seen = (index as i64) + 1;
+            state.peers.push(peer);
+        }
+        assert_eq!(state.peers.len(), MAX_PEERS + 1);
+
+        enforce_peer_cap(&mut state);
+
+        assert_eq!(state.peers.len(), MAX_PEERS);
+        assert!(state.peers.iter().any(|peer| peer.id == "keep-paired"));
+        // The stalest unpaired peer (u0, last_seen=1) was the one dropped.
+        assert!(!state.peers.iter().any(|peer| peer.id == "u0"));
+    }
+
+    #[test]
+    fn clamp_device_name_bounds_length() {
+        let long = "a".repeat(MAX_DEVICE_NAME_LEN + 50);
+        assert_eq!(clamp_device_name(&long).chars().count(), MAX_DEVICE_NAME_LEN);
+        assert_eq!(clamp_device_name("  Desk  "), "Desk");
+        assert_eq!(clamp_device_name("   "), "Unknown device");
     }
 }

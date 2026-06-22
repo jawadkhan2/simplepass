@@ -1082,11 +1082,58 @@ progress::-moz-progress-bar {
 }
 
 .fi-root {
+  position: relative;
   display: flex;
   align-items: center;
   width: 100vw;
   height: 100vh;
   overflow: hidden;
+}
+
+/* While the radar pulse plays the window is a centred square, so centre the icon
+   (and the rings drawn behind it) instead of left-aligning for the status pill. */
+.fi-root.radar {
+  justify-content: center;
+}
+
+/* Expanding sonar rings that radiate from the icon to draw the eye to the centre
+   of the screen where the freshly enabled widget now sits. */
+.fi-radar {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 72px;
+  height: 72px;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.fi-radar span {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid rgba(232, 160, 126, 0.75);
+  opacity: 0;
+  animation: fi-radar 1.6s ease-out infinite;
+}
+
+.fi-radar span:nth-child(2) {
+  animation-delay: 0.53s;
+}
+
+.fi-radar span:nth-child(3) {
+  animation-delay: 1.06s;
+}
+
+@keyframes fi-radar {
+  0% {
+    transform: scale(0.55);
+    opacity: 0.85;
+  }
+  100% {
+    transform: scale(2.6);
+    opacity: 0;
+  }
 }
 
 .floating-icon {

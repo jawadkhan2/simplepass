@@ -8,6 +8,8 @@ export const api = {
     invoke<SetupState>("save_setup", { deviceName, startAtLogin }),
   setAvatar: (avatar: string | null) => invoke<SetupState>("set_avatar", { avatar }),
   setFloatingIcon: (enabled: boolean) => invoke<SetupState>("set_floating_icon", { enabled }),
+  setAutoOpen: (enabled: boolean) => invoke<SetupState>("set_auto_open", { enabled }),
+  collapseWidget: () => invoke<void>("collapse_widget"),
   saveWidgetPosition: (x: number, y: number) => invoke<void>("save_widget_position", { x, y }),
   showWindow: () => invoke<void>("show_window"),
   listPeers: () => invoke<PeerDevice[]>("list_peers"),
@@ -48,5 +50,9 @@ export const events = {
   onSetupChanged: (handler: (setup: SetupState) => void) =>
     listen<SetupState>("setup-changed", (event) => handler(event.payload)),
   onTransportError: (handler: (message: string) => void) =>
-    listen<string>("transport-error", (event) => handler(event.payload))
+    listen<string>("transport-error", (event) => handler(event.payload)),
+  // Fired at the widget window when it is freshly revealed/centered, so it can
+  // play the radar pulse that points the user to the screen centre.
+  onWidgetReveal: (handler: () => void) =>
+    listen("widget-reveal", () => handler())
 };

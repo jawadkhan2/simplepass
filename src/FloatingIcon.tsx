@@ -14,6 +14,11 @@ const DRAG_THRESHOLD = 4;
 const IDLE_SIZE = 72;
 const ACTIVE_WIDTH = 252;
 
+// How long the radar pulse plays before the window collapses back to the resting
+// icon. The radar square size itself is set by the backend (WIDGET_RADAR_SIZE)
+// before the window is shown, so it appears already centred at full size.
+const RADAR_DURATION = 3000;
+
 // A dropped file has no OS path here (see the component note), so it is read in
 // memory and streamed to the backend in slices of this size to bound peak usage.
 const STAGE_CHUNK = 1024 * 1024;
@@ -101,6 +106,7 @@ function extractDroppedText(data: DataTransfer | null): string | null {
 export default function FloatingIcon() {
   const press = useRef<{ x: number; y: number; dragging: boolean } | null>(null);
   const [feedback, setFeedback] = useState<Feedback>({ kind: "idle" });
+  const [radar, setRadar] = useState(false);
 
   // Live state for the once-mounted drop/transfer listeners (avoids stale closures).
   const batch = useRef<Batch | null>(null);
@@ -124,6 +130,41 @@ export default function FloatingIcon() {
       });
     return () => {
       cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  // When the backend reveals the widget (the user just ticked the box), grow the
+  // window to a centred square, play a radar pulse so the user spots it in the
+  // middle of the screen, then collapse back to the resting icon.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    // The backend already sized the window to the radar square and centred it
+    // before showing it, so just play the rings, then ask the backend to collapse
+    // it back to the resting icon (resize + re-centre done in Rust so the icon
+    // doesn't end up offset from a JS resize/center race).
+    function playRadar() {
+      setRadar(true);
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        setRadar(false);
+        void api.collapseWidget().catch(() => undefined);
+      }, RADAR_DURATION);
+    }
+
+    void events
+      .onWidgetReveal(() => void playRadar())
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      });
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
       if (unlisten) unlisten();
     };
   }, []);
@@ -418,7 +459,14 @@ export default function FloatingIcon() {
   }
 
   return (
-    <div className="fi-root">
+    <div className={`fi-root${radar ? " radar" : ""}`}>
+      {radar && (
+        <div className="fi-radar" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </div>
+      )}
       <button
         className={`floating-icon${feedback.kind === "dragover" ? " drag-over" : ""}`}
         title="Open SimplePass — or drop files, links, or text to send"
