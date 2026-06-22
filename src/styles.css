@@ -354,26 +354,6 @@ input:focus {
   opacity: 0.82;
 }
 
-.tile-menu {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  color: var(--ink-dim);
-}
-
-.tile-menu button {
-  width: 28px;
-  height: 28px;
-  display: grid;
-  place-items: center;
-  border-radius: 8px;
-  color: var(--clay);
-  background: transparent;
-}
-
 .device-avatar {
   width: 76px;
   height: 76px;

@@ -9,12 +9,10 @@ import {
   MessageSquare,
   Minus,
   Monitor,
-  MoreVertical,
   RefreshCw,
   Settings,
   Share2,
   Square,
-  Trash2,
   X
 } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
@@ -482,10 +480,6 @@ export default function App() {
                 onPair={() => api.pairPeer(peer.id).catch((err) => setError(String(err)))}
                 onChat={() => setChatPeerId(peer.id)}
                 onShare={() => openShareDialog(peer)}
-                onDelete={() => {
-                  if (!window.confirm(`Delete ${peer.name}? This removes the pairing and its chat history.`)) return;
-                  api.deletePeer(peer.id).catch((err) => setError(String(err)));
-                }}
               />
             ))}
             {peers.length === 0 && (
@@ -620,7 +614,6 @@ function DeviceTile(props: {
   onPair: () => void;
   onChat: () => void;
   onShare: () => void;
-  onDelete: () => void;
 }) {
   const { peer } = props;
   const paired = peer.trustState === "paired";
@@ -633,12 +626,6 @@ function DeviceTile(props: {
       }`}
       onClick={props.onSelect}
     >
-      <div className="tile-menu">
-        <button title="Delete computer" onClick={(event) => { event.stopPropagation(); props.onDelete(); }}>
-          <Trash2 size={16} />
-        </button>
-        <MoreVertical size={16} />
-      </div>
       <div className="device-avatar">
         <Avatar src={peer.avatar} size={34} />
       </div>
