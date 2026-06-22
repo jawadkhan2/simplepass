@@ -44,11 +44,36 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      # The macOS DMG bundler (bundle_dmg.sh) intermittently fails on GitHub's
+      # headless runners: it drives Finder via AppleScript to lay out the DMG
+      # window and races hdiutil ("failed to run bundle_dmg.sh" / device busy).
+      # It is flaky infra, not a build error — a plain re-run succeeds. To avoid
+      # a manual re-run on every release, the first attempt is allowed to fail
+      # (continue-on-error) and a second, identical attempt runs only if it did.
+      # tauri-action is idempotent against an existing release, so the retry just
+      # uploads whatever the first attempt did not (and rewrites latest.json).
       - name: Build and publish release
+        id: build
+        continue-on-error: true
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Updater signing key + password (set as repository secrets).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "SimplePass __VERSION__"
+          releaseBody: "Download an installer below. Existing installs update automatically."
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      - name: Build and publish release (retry)
+        if: steps.build.outcome == 'failure'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
