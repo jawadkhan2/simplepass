@@ -9,7 +9,10 @@ export const api = {
   setAvatar: (avatar: string | null) => invoke<SetupState>("set_avatar", { avatar }),
   setFloatingIcon: (enabled: boolean) => invoke<SetupState>("set_floating_icon", { enabled }),
   setAutoOpen: (enabled: boolean) => invoke<SetupState>("set_auto_open", { enabled }),
+  setTheme: (theme: "light" | "dark") => invoke<SetupState>("set_theme", { theme }),
   collapseWidget: () => invoke<void>("collapse_widget"),
+  setWidgetActive: (active: boolean, activeWidth: number, apply: boolean) =>
+    invoke<"left" | "right">("set_widget_active", { active, activeWidth, apply }),
   saveWidgetPosition: (x: number, y: number) => invoke<void>("save_widget_position", { x, y }),
   showWindow: () => invoke<void>("show_window"),
   listPeers: () => invoke<PeerDevice[]>("list_peers"),

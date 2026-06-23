@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SimplePass — "Warm Ember" Dark Theme Proposal</title>
+<style>
+  /* ============================================================
+     PROPOSED DARK THEME — "Warm Ember"
+     Keeps the existing clay / sage / gold accent identity, swaps the
+     cream paper surfaces for a warm charcoal stack. Drop the :root
+     block below into src/styles.css (or guard it behind a
+     [data-theme="dark"] selector) to ship it.
+     ============================================================ */
+  :root {
+    /* --- dark surfaces (warm charcoal, slight brown tint) --- */
+    --paper: #14110e;   /* app background (was #f4ede1) */
+    --shell: #100d0b;   /* setup/loading shell (was #e7dccb) */
+    --card:  #1e1a16;   /* panels, tiles, inputs (was #fbf7f0) */
+    --line:  #322b24;   /* hairline borders (was #e4d9c6) */
+
+    /* --- text --- */
+    --ink:     #f2e9dc; /* primary text (was #3b342c) */
+    --ink-dim: #a3947f; /* secondary text (was #8a7d6b) */
+
+    /* --- accents (kept, nudged brighter for dark bg) --- */
+    --clay:      #e0764c; /* primary action (was #c8643c) */
+    --clay-soft: #f0a07a; /* gradient top / focus */
+    --sage:      #9fae74; /* online / success (was #7d8a5c) */
+    --gold:      #e6b450; /* progress fill (was #d8a13a) */
+
+    /* helper for inputs / fingerprint chips on dark */
+    --surface-2: rgba(255, 255, 255, 0.06);
+
+    /* motion tokens unchanged */
+    --dur-1: 120ms; --dur-2: 200ms; --dur-3: 320ms;
+    --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+    --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+    --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--ink);
+    line-height: 1.55;
+    /* warm radial glows on the charcoal base — mirrors the light shell */
+    background:
+      radial-gradient(circle at 12% -5%, rgba(224, 118, 76, 0.16), transparent 38rem),
+      radial-gradient(circle at 95% 0%, rgba(159, 174, 116, 0.10), transparent 34rem),
+      var(--paper);
+    min-height: 100vh;
+  }
+  code, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.86em;
+  }
+
+  header.hero { max-width: 1040px; margin: 0 auto; padding: 56px 28px 8px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 14px; border-radius: 999px;
+    background: rgba(224, 118, 76, 0.16); color: var(--clay-soft);
+    font-size: 12.5px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase;
+  }
+  .hero h1 { margin: 16px 0 6px; font-size: 34px; font-weight: 800; letter-spacing: -0.6px; }
+  .hero h1 span { color: var(--clay); }
+  .hero p { margin: 0; color: var(--ink-dim); max-width: 62ch; }
+
+  section { max-width: 1040px; margin: 0 auto; padding: 28px; }
+  h2.sect { font-size: 13px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-dim); margin: 0 0 16px; }
+
+  /* ---- swatch grid ---- */
+  .swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .swatch { border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: var(--card); }
+  .swatch .chip { height: 64px; }
+  .swatch .meta { padding: 10px 12px; display: grid; gap: 2px; }
+  .swatch .meta strong { font-size: 13px; }
+  .swatch .meta code { color: var(--ink-dim); font-size: 12px; }
+
+  /* ============================================================
+     MOCKUP — real component classes from src/styles.css, recolored
+     by the dark :root above so you see the theme as it ships.
+     ============================================================ */
+  .mock-window {
+    border: 1px solid var(--line); border-radius: 16px; overflow: hidden;
+    box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+    background: var(--paper);
+  }
+
+  /* titlebar */
+  .titlebar { height: 40px; display: flex; align-items: stretch; background: var(--card); border-bottom: 1px solid var(--line); }
+  .titlebar-drag { flex: 1; display: flex; align-items: center; gap: 9px; padding-left: 14px; }
+  .titlebar-title { font-size: 12.5px; font-weight: 600; color: var(--ink); }
+  .titlebar-controls { display: flex; }
+  .titlebar-btn { width: 46px; display: grid; place-items: center; background: transparent; border: 0; color: var(--ink-dim); }
+  .titlebar-btn:hover { background: rgba(255, 255, 255, 0.06); color: var(--ink); }
+  .titlebar-btn.close:hover { background: var(--clay); color: #fff; }
+
+  /* topbar */
+  .topbar { height: 72px; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; border-bottom: 1px solid var(--line); background: var(--card); }
+  .brand { display: flex; align-items: center; gap: 14px; }
+  .brand-mark { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 13px; color: #fff; font-weight: 800; background: linear-gradient(135deg, var(--clay-soft), var(--clay)); box-shadow: 0 6px 16px rgba(224, 118, 76, 0.34); }
+  .topbar h1 { margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.4px; }
+  .brand-accent { color: var(--clay); }
+  .topbar-right { display: flex; align-items: center; gap: 10px; }
+  .icon-button { width: 38px; height: 38px; display: inline-grid; place-items: center; border-radius: 12px; color: var(--ink); background: var(--card); border: 1px solid var(--line); }
+  .me-avatar { width: 32px; height: 32px; display: inline-grid; place-items: center; border-radius: 10px; color: #fff; font-weight: 700; font-size: 13px; background: linear-gradient(135deg, var(--clay-soft), var(--clay)); }
+
+  /* update banner */
+  .update-banner { display: flex; align-items: center; gap: 10px; padding: 10px 24px; border-bottom: 1px solid var(--line); color: var(--ink); font-size: 13px; font-weight: 600;
+    background: linear-gradient(90deg, rgba(240, 160, 122, 0.18), rgba(224, 118, 76, 0.12)); }
+  .update-banner-apply { min-height: 32px; padding: 0 14px; border: 0; border-radius: 10px; font-weight: 700; color: #fff; background: var(--clay); cursor: pointer; }
+
+  /* workspace */
+  .workspace { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 18px; padding: 22px; background: var(--paper); }
+  .devices-panel, .chat-panel { border: 1px solid var(--line); border-radius: 18px; background: var(--card); }
+  .devices-panel { padding: 22px; }
+  .section-heading { display: flex; align-items: center; gap: 12px; }
+  .section-heading h2 { margin: 0; font-size: 18px; font-weight: 800; letter-spacing: -0.3px; }
+  .section-heading .count { font-size: 12px; font-weight: 600; color: var(--sage); background: rgba(159, 174, 116, 0.16); padding: 5px 12px; border-radius: 999px; margin-left: auto; }
+
+  .device-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 16px; padding-top: 20px; }
+  .device-tile { position: relative; min-height: 210px; display: grid; align-content: center; justify-items: center; gap: 8px; padding: 18px 14px; border: 1px solid var(--line); border-radius: 18px; background: var(--card); box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3); transition: border-color 160ms ease, transform 160ms ease, box-shadow 160ms ease; }
+  .device-tile:hover { transform: translateY(-3px); box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45); }
+  .device-tile.selected { border-color: var(--clay); box-shadow: 0 0 0 2px rgba(224, 118, 76, 0.35), 0 12px 28px rgba(0, 0, 0, 0.45); }
+  .device-avatar { width: 72px; height: 72px; display: grid; place-items: center; border-radius: 20px; color: #fff; font-size: 26px; font-weight: 700; background: linear-gradient(135deg, var(--clay-soft), var(--clay)); }
+  .device-tile h3 { margin: 6px 0 0; color: var(--ink); font-size: 16px; font-weight: 700; }
+  .status-dot { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-dim); font-size: 12px; font-weight: 600; }
+  .status-dot::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #4a4036; }
+  .status-dot.online { color: var(--sage); }
+  .status-dot.online::before { background: var(--sage); box-shadow: 0 0 0 0 rgba(159, 174, 116, 0.5); animation: halo 2s var(--ease-in-out) infinite; }
+  @keyframes halo { 70%, 100% { box-shadow: 0 0 0 7px rgba(159, 174, 116, 0); } }
+  .tile-actions { width: 100%; margin-top: 8px; display: flex; gap: 8px; }
+  .tile-actions .primary { flex: 1; min-height: 38px; border: 0; border-radius: 13px; font-weight: 700; color: #fff; background: var(--clay); }
+  .tile-actions .ghost-btn { flex: 1; min-height: 38px; border-radius: 13px; font-weight: 700; color: var(--clay); background: transparent; border: 1.5px solid var(--clay); }
+  .tile-check { position: absolute; top: -8px; right: -8px; width: 26px; height: 26px; display: grid; place-items: center; border-radius: 50%; color: #fff; background: var(--sage); box-shadow: 0 4px 10px rgba(0, 0, 0, 0.4); }
+
+  /* chat */
+  .chat-panel { display: grid; grid-template-rows: auto 1fr auto; padding: 18px; background: var(--paper); }
+  .chat-peer { display: flex; align-items: center; gap: 10px; }
+  .chat-avatar { width: 36px; height: 36px; display: inline-grid; place-items: center; border-radius: 11px; color: #fff; font-weight: 700; background: linear-gradient(135deg, var(--clay-soft), var(--clay)); }
+  .chat-peer h2 { margin: 0; font-size: 16px; font-weight: 800; }
+  .chat-peer .status-dot { font-weight: 600; }
+  .message-list { display: flex; flex-direction: column; gap: 10px; padding: 18px 2px; min-height: 220px; }
+  .message { max-width: 82%; border-radius: 16px; padding: 11px 14px; font-size: 13.5px; line-height: 1.45; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-bottom-left-radius: 5px; }
+  .message.sent { align-self: flex-end; color: #fff; background: var(--clay); border: 0; border-bottom-left-radius: 16px; border-bottom-right-radius: 5px; }
+  .file-message { display: flex; align-items: center; gap: 10px; }
+  .file-icon { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 8px; background: rgba(255,255,255,0.08); }
+  .file-message.sent .file-icon { background: rgba(255,255,255,0.2); }
+  .file-meta { display: grid; gap: 1px; }
+  .file-meta small { opacity: 0.8; font-size: 11.5px; }
+  .file-open { min-height: 28px; border: 0; border-radius: 9px; padding: 0 12px; font-weight: 700; font-size: 12px; color: var(--clay); background: rgba(255,255,255,0.92); cursor: pointer; }
+  .composer { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+  .composer input { min-height: 42px; border: 1px solid var(--line); border-radius: 14px; padding: 0 14px; color: var(--ink); background: var(--card); outline: none; }
+  .composer input::placeholder { color: var(--ink-dim); }
+  .composer input:focus { border-color: var(--clay-soft); }
+  .composer .primary { min-height: 42px; border: 0; border-radius: 13px; padding: 0 18px; font-weight: 700; color: #fff; background: var(--clay); }
+
+  /* transfer dock */
+  .transfer-dock { padding: 14px 22px 18px; border-top: 1px solid var(--line); background: var(--card); }
+  .transfer-row { display: grid; grid-template-columns: minmax(120px,1fr) minmax(160px,2fr) 60px auto; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper); }
+  .transfer-row small { color: var(--ink-dim); }
+  progress { width: 100%; height: 8px; border: 0; border-radius: 999px; background: #2a241e; overflow: hidden; -webkit-appearance: none; appearance: none; }
+  progress::-webkit-progress-bar { background: #2a241e; border-radius: 999px; }
+  progress::-webkit-progress-value { background: linear-gradient(90deg, var(--gold), var(--clay)); border-radius: 999px; }
+  .transfer-cancel { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--ink-dim); cursor: pointer; }
+
+  /* toast */
+  .toast-error { margin-top: 16px; display: inline-flex; align-items: center; gap: 12px; padding: 12px; border: 1px solid rgba(224,118,76,0.5); border-radius: 14px; color: #f6c0a6; background: rgba(224, 118, 76, 0.14); box-shadow: 0 18px 42px rgba(0,0,0,0.5); }
+  .toast-error button { min-height: 30px; border: 0; border-radius: 10px; padding: 0 12px; font-weight: 700; color: #fff; background: var(--clay); cursor: pointer; }
+
+  .note { color: var(--ink-dim); font-size: 13px; margin-top: 10px; }
+  .code-block { margin-top: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--shell); padding: 16px 18px; overflow-x: auto; }
+  .code-block pre { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; line-height: 1.7; color: var(--ink); }
+  .code-block .c { color: var(--ink-dim); }
+  .code-block .v { color: var(--gold); }
+  footer { max-width: 1040px; margin: 0 auto; padding: 8px 28px 56px; color: var(--ink-dim); font-size: 12.5px; }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <span class="badge">Dark theme proposal</span>
+  <h1>Warm <span>Ember</span></h1>
+  <p>The dark counterpart to "Warm Paper". Same clay / sage / gold accent identity — only the cream surfaces swap for a warm charcoal stack (slight brown tint, never flat blue-black), so the app keeps its character at night.</p>
+</header>
+
+<section>
+  <h2 class="sect">Palette</h2>
+  <div class="swatches">
+    <div class="swatch"><div class="chip" style="background:#14110e"></div><div class="meta"><strong>--paper</strong><code>#14110e</code></div></div>
+    <div class="swatch"><div class="chip" style="background:#100d0b"></div><div class="meta"><strong>--shell</strong><code>#100d0b</code></div></div>
+    <div class="swatch"><div class="chip" style="background:#1e1a16"></div><div class="meta"><strong>--card</strong><code>#1e1a16</code></div></div>
+    <div class="swatch"><div class="chip" style="background:#322b24"></div><div class="meta"><strong>--line</strong><code>#322b24</code></div></div>
+    <div class="swatch"><div class="chip" style="background:#f2e9dc"></div><div class="meta"><strong>--ink</strong><code>#f2e9dc</code></div></div>
+    <div class="swatch"><div class="chip" style="background:#a3947f"></div><div class="meta"><strong>--ink-dim</strong><code>#a3947f</code></div></div>
+    <div class="swatch"><div class="chip" style="background:#e0764c"></div><div class="meta"><strong>--clay</strong><code>#e0764c</code></div></div>
+    <div class="swatch"><div class="chip" style="background:#f0a07a"></div><div class="meta"><strong>--clay-soft</strong><code>#f0a07a</code></div></div>
+    <div class="swatch"><div class="chip" style="background:#9fae74"></div><div class="meta"><strong>--sage</strong><code>#9fae74</code></div></div>
+    <div class="swatch"><div class="chip" style="background:#e6b450"></div><div class="meta"><strong>--gold</strong><code>#e6b450</code></div></div>
+  </div>
+</section>
+
+<section>
+  <h2 class="sect">Live mockup</h2>
+  <div class="mock-window">
+    <!-- titlebar -->
+    <div class="titlebar">
+      <div class="titlebar-drag">
+        <span class="me-avatar" style="width:18px;height:18px;border-radius:5px;font-size:9px">S</span>
+        <span class="titlebar-title">SimplePass</span>
+      </div>
+      <div class="titlebar-controls">
+        <button class="titlebar-btn">&#9472;</button>
+        <button class="titlebar-btn">&#9633;</button>
+        <button class="titlebar-btn close">&#10005;</button>
+      </div>
+    </div>
+
+    <!-- topbar -->
+    <div class="topbar">
+      <div class="brand">
+        <span class="brand-mark">S</span>
+        <h1>Simple<span class="brand-accent">Pass</span></h1>
+      </div>
+      <div class="topbar-right">
+        <button class="icon-button">&#9881;</button>
+        <span class="me-avatar">JK</span>
+      </div>
+    </div>
+
+    <!-- update banner -->
+    <div class="update-banner">
+      <span>&#8593;</span>
+      <span class="update-banner-text">Update available — v0.1.6 ready to install.</span>
+      <button class="update-banner-apply">Restart &amp; update</button>
+    </div>
+
+    <!-- workspace -->
+    <div class="workspace">
+      <!-- devices -->
+      <div class="devices-panel">
+        <div class="section-heading">
+          <h2>Nearby computers</h2>
+          <span class="count">3 online</span>
+        </div>
+        <div class="device-grid">
+          <div class="device-tile selected">
+            <span class="tile-check">&#10003;</span>
+            <div class="device-avatar">DT</div>
+            <h3>Desktop-PC</h3>
+            <span class="status-dot online">Online · paired</span>
+            <div class="tile-actions">
+              <button class="primary">Send</button>
+              <button class="ghost-btn">Chat</button>
+            </div>
+          </div>
+          <div class="device-tile">
+            <div class="device-avatar">MB</div>
+            <h3>MacBook-Air</h3>
+            <span class="status-dot online">Online · paired</span>
+            <div class="tile-actions">
+              <button class="primary">Send</button>
+              <button class="ghost-btn">Chat</button>
+            </div>
+          </div>
+          <div class="device-tile">
+            <div class="device-avatar">SL</div>
+            <h3>Studio-Linux</h3>
+            <span class="status-dot">Offline</span>
+            <div class="tile-actions">
+              <button class="ghost-btn" style="flex:1">Pair</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- chat -->
+      <div class="chat-panel">
+        <div class="chat-peer">
+          <span class="chat-avatar">DT</span>
+          <div>
+            <h2>Desktop-PC</h2>
+            <span class="status-dot online">Online</span>
+          </div>
+        </div>
+        <div class="message-list">
+          <p class="message">Hey — sending the design files over now.</p>
+          <p class="message sent">Got it, thanks!</p>
+          <div class="message file-message">
+            <span class="file-icon">&#128196;</span>
+            <div class="file-meta"><strong>brand-kit.zip</strong><small>14.2 MB</small></div>
+            <button class="file-open">Open</button>
+          </div>
+          <p class="message sent">Perfect, opening it.</p>
+        </div>
+        <div class="composer">
+          <input placeholder="Message Desktop-PC…" />
+          <button class="primary">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- transfer dock -->
+    <div class="transfer-dock">
+      <div class="transfer-row">
+        <div><strong style="font-size:13px">demo-video.mp4</strong><br><small>to MacBook-Air</small></div>
+        <progress value="62" max="100"></progress>
+        <small>62%</small>
+        <button class="transfer-cancel">&#10005;</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-error">
+    <span>&#9888; Couldn't reach Studio-Linux — peer went offline.</span>
+    <button>Dismiss</button>
+  </div>
+  <p class="note">Every element above uses the real component class names from <code>src/styles.css</code>, recolored only by the dark token block — so this is the theme as it would actually ship.</p>
+</section>
+
+<section>
+  <h2 class="sect">How to ship it</h2>
+  <p class="note">Simplest: replace the <code>:root</code> color vars in <code>src/styles.css</code> with the block below (motion tokens stay as-is). To support a toggle instead, scope these under <code>:root[data-theme="dark"]</code> and set the attribute from Settings.</p>
+  <div class="code-block"><pre>:root {
+  <span class="c">/* Warm Ember — dark theme */</span>
+  --paper: <span class="v">#14110e</span>;
+  --shell: <span class="v">#100d0b</span>;
+  --card:  <span class="v">#1e1a16</span>;
+  --line:  <span class="v">#322b24</span>;
+  --ink:     <span class="v">#f2e9dc</span>;
+  --ink-dim: <span class="v">#a3947f</span>;
+  --clay:      <span class="v">#e0764c</span>;
+  --clay-soft: <span class="v">#f0a07a</span>;
+  --sage:      <span class="v">#9fae74</span>;
+  --gold:      <span class="v">#e6b450</span>;
+  --surface-2: <span class="v">rgba(255, 255, 255, 0.06)</span>;
+}</pre></div>
+  <p class="note"><strong>Two spots in styles.css use hardcoded light colors</strong> that should also be themed for dark: the <code>progress</code> track <code>#ece3d3</code> → <code>#2a241e</code>, and the <code>.toast-error</code> light fill <code>#fdf0e8</code> / text <code>#7a3320</code> → a translucent clay tint as shown in the mockup. The status-dot offline color <code>#c9bca6</code> → <code>#4a4036</code>.</p>
+</section>
+
+<footer>SimplePass — Warm Ember dark theme proposal · accent identity preserved, surfaces inverted to warm charcoal.</footer>
+
+</body>
+</html>

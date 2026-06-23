@@ -110,6 +110,9 @@ struct SetupState {
     /// viewer as they arrive (files with no associated handler are skipped).
     #[serde(default)]
     auto_open: bool,
+    /// UI color theme: "light" (Warm Paper, default) or "dark" (Warm Ember).
+    #[serde(default = "default_theme")]
+    theme: String,
     /// Last on-screen position of the floating icon, so it reappears where the
     /// user left it across launches.
     #[serde(default)]
@@ -130,9 +133,15 @@ struct SetupResponse {
     floating_icon: bool,
     #[serde(default)]
     auto_open: bool,
+    #[serde(default = "default_theme")]
+    theme: String,
     /// Our own X25519 public key (base64), so the UI can show a verification
     /// fingerprint the user can read out-of-band when approving a pairing.
     public_key: Option<String>,
+}
+
+fn default_theme() -> String {
+    "light".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +245,7 @@ impl Default for PersistedState {
                 avatar: None,
                 floating_icon: false,
                 auto_open: false,
+                theme: default_theme(),
                 widget_x: None,
                 widget_y: None,
             },
@@ -297,6 +307,16 @@ struct AppState {
     /// Timestamp (ms) of the last auto-open, used to rate-limit auto-opening of
     /// received files/links. See `auto_open_rate_ok`.
     last_auto_open: Mutex<i64>,
+    /// Resting top-left (physical px) of the widget, captured when it expands to
+    /// show the status pill so `set_widget_active(false)` can restore it. When the
+    /// widget grows leftward (no room on the right of its monitor) the window is
+    /// moved, and this is the only record of where the resting icon belonged.
+    widget_anchor: Mutex<Option<PhysicalPosition<i32>>>,
+    /// True while the widget is expanded to show the status pill. Programmatic
+    /// resizes/moves during expansion fire `onMoved` in the webview; this flag tells
+    /// `save_widget_position` to ignore those so the persisted position stays the
+    /// resting anchor rather than a transient expanded offset.
+    widget_active: AtomicBool,
 }
 
 /// One open TCP connection to a target peer for an in-flight outgoing file.
@@ -347,6 +367,7 @@ fn save_setup(
         avatar: existing.avatar.clone(),
         floating_icon: existing.floating_icon,
         auto_open: existing.auto_open,
+        theme: existing.theme.clone(),
         widget_x: existing.widget_x,
         widget_y: existing.widget_y,
     };
@@ -1197,7 +1218,18 @@ fn set_avatar(app: AppHandle, state: State<AppState>, avatar: Option<String>) ->
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    // Must be the FIRST plugin registered so it intercepts a duplicate launch before
+    // any window is created. When the updater relaunches us on Windows the old instance
+    // can still be tearing down; without this the two processes race for the ports and
+    // WebView2 user-data dir, leaving the new window stuck on "Starting SimplePass…".
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            reveal_main_window(app);
+        }));
+    }
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
@@ -1224,6 +1256,8 @@ pub fn run() {
                 incoming_files: Mutex::new(HashMap::new()),
                 cancels: Mutex::new(HashMap::new()),
                 last_auto_open: Mutex::new(0),
+                widget_anchor: Mutex::new(None),
+                widget_active: AtomicBool::new(false),
             });
             build_tray(app.handle())?;
             if widget.0 {
@@ -1275,7 +1309,9 @@ pub fn run() {
             show_window,
             set_floating_icon,
             set_auto_open,
+            set_theme,
             collapse_widget,
+            set_widget_active,
             save_widget_position
         ])
         .run(tauri::generate_context!())
@@ -1289,8 +1325,28 @@ fn start_transport(app: AppHandle) {
     thread::spawn(move || run_discovery(discovery_app));
 }
 
+/// Retry a socket bind for a few seconds before giving up. A too-fast restart can
+/// leave the previous instance briefly holding the port; a single bind attempt
+/// would then fail and kill the transport for the whole session (only a banner, no
+/// recovery until the next launch). Retrying rides out the stale bind. ~5s budget.
+fn bind_with_retry<T>(mut bind: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut attempt = 0;
+    loop {
+        match bind() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                attempt += 1;
+                if attempt >= 10 {
+                    return Err(err);
+                }
+                thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+}
+
 fn run_tcp_listener(app: AppHandle) {
-    let listener = match TcpListener::bind(("0.0.0.0", TRANSPORT_PORT)) {
+    let listener = match bind_with_retry(|| TcpListener::bind(("0.0.0.0", TRANSPORT_PORT))) {
         Ok(listener) => listener,
         Err(err) => {
             let _ = app.emit(
@@ -1434,7 +1490,7 @@ fn handle_message(
 }
 
 fn run_discovery(app: AppHandle) {
-    let socket = match UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) {
+    let socket = match bind_with_retry(|| UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))) {
         Ok(socket) => socket,
         Err(err) => {
             let _ = app.emit(
@@ -1779,6 +1835,7 @@ fn setup_response(setup: &SetupState) -> SetupResponse {
         avatar: setup.avatar.clone(),
         floating_icon: setup.floating_icon,
         auto_open: setup.auto_open,
+        theme: setup.theme.clone(),
         public_key: derive_public_key(&setup.identity_secret).ok(),
     }
 }
@@ -1978,7 +2035,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => reveal_main_window(app),
-            "quit" => app.exit(0),
+            "quit" => quit_app(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -1993,6 +2050,26 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         })
         .build(app)?;
     Ok(())
+}
+
+/// Fully shut the app down from the tray. We destroy the webview windows *before*
+/// exiting so WebView2 tears down its host processes (msedgewebview2.exe) cleanly.
+/// A bare `app.exit(0)` does a fast process exit while the windows are still open,
+/// orphaning those host processes — and on Windows they keep the per-app WebView2
+/// user-data dir (EBWebView) locked. The *next* launch's WebView2 then can't open
+/// that locked dir, so the new window hangs forever on the "Starting SimplePass"
+/// loading screen until the orphan finally dies. destroy() force-closes without the
+/// CloseRequested handler, which would otherwise just hide the window. The short
+/// delay lets the host processes exit before we terminate.
+fn quit_app(app: &AppHandle) {
+    for (_, window) in app.webview_windows() {
+        let _ = window.destroy();
+    }
+    let app = app.clone();
+    thread::spawn(move || {
+        thread::sleep(std::time::Duration::from_millis(300));
+        app.exit(0);
+    });
 }
 
 fn reveal_main_window(app: &AppHandle) {
@@ -2128,6 +2205,21 @@ fn set_auto_open(app: AppHandle, state: State<AppState>, enabled: bool) -> AppRe
     Ok(response)
 }
 
+/// Set the UI color theme ("light" or "dark") and persist the preference. Any
+/// unrecognized value falls back to "light".
+#[tauri::command]
+fn set_theme(app: AppHandle, state: State<AppState>, theme: String) -> AppResult<SetupResponse> {
+    let theme = if theme == "dark" { "dark" } else { "light" }.to_string();
+    let response = {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        persisted.setup.theme = theme;
+        save_state(&state.path, &persisted)?;
+        setup_response(&persisted.setup)
+    };
+    let _ = app.emit("setup-changed", response.clone());
+    Ok(response)
+}
+
 /// Collapse the widget from its radar square back to the resting icon, keeping it
 /// centred. Done in Rust because a JS `center()` right after a resize races the
 /// resize and leaves the icon offset (up-left) instead of centred.
@@ -2140,9 +2232,109 @@ fn collapse_widget(app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
+/// Decide which side of the icon the status pill will expand toward, given the
+/// resting top-left `anchor`, without touching the window. Returns the side plus,
+/// for a leftward grow, the new top-left x to move to (the window shifts left by the
+/// extra width so the icon stays put and the pill fills the space to its left).
+///
+/// Multi-monitor safe: bounds come from the widget's current monitor, not the
+/// primary display. Falls back to growing right (top-left fixed) when there is no
+/// monitor info or the icon isn't near the right edge.
+fn widget_grow_plan(
+    win: &tauri::WebviewWindow,
+    anchor: PhysicalPosition<i32>,
+    active_width: f64,
+) -> (bool, i32) {
+    let monitor = match win.current_monitor() {
+        Ok(Some(m)) => m,
+        _ => return (false, anchor.x),
+    };
+    let scale = monitor.scale_factor();
+    let idle_px = (WIDGET_IDLE_SIZE * scale).round() as i32;
+    let active_px = (active_width * scale).round() as i32;
+    let extra_px = (active_px - idle_px).max(0);
+    let left_bound = monitor.position().x;
+    let right_bound = left_bound + monitor.size().width as i32;
+
+    // Grow left only when the expanded window would overflow the right edge but there
+    // is room once it's shifted back.
+    let grow_left = anchor.x + active_px > right_bound && anchor.x - extra_px >= left_bound;
+    if grow_left {
+        ((true), (anchor.x - extra_px).max(left_bound))
+    } else {
+        (false, anchor.x)
+    }
+}
+
+/// Expand the widget window to show the status pill, or collapse it back to the
+/// resting icon. Split into a non-mutating *decide* phase (`apply = false`) and an
+/// *apply* phase (`apply = true`) so the webview can commit its layout flip (icon to
+/// the right, pill to the left, for a leftward grow) *before* the window actually
+/// moves — otherwise the icon flashes on the wrong side for a frame. The frontend
+/// calls decide → flip its DOM → apply.
+///
+/// The window grows sideways from the resting `WIDGET_IDLE_SIZE` square to
+/// `active_width`. Growing right keeps the top-left fixed; growing left moves the
+/// window so the icon stays put. Returns the side the pill ends up on
+/// ("left"/"right").
+#[tauri::command]
+fn set_widget_active(
+    app: AppHandle,
+    state: State<AppState>,
+    active: bool,
+    active_width: f64,
+    apply: bool,
+) -> AppResult<String> {
+    let win = app
+        .get_webview_window(WIDGET_LABEL)
+        .ok_or_else(|| "Floating widget window is unavailable.".to_string())?;
+
+    if !active {
+        // Collapse: restore the resting square at the captured anchor, then clear it.
+        let anchor = state.widget_anchor.lock().map_err(lock_err)?.take();
+        let _ = win.set_size(LogicalSize::new(WIDGET_IDLE_SIZE, WIDGET_IDLE_SIZE));
+        if let Some(pos) = anchor {
+            let _ = win.set_position(pos);
+        }
+        state.widget_active.store(false, Ordering::SeqCst);
+        return Ok("right".to_string());
+    }
+
+    // Capture the resting top-left before any resize/move so collapse can restore it,
+    // and so both phases plan against the same anchor. Only capture the first time we
+    // expand (the decide phase): an apply must not re-read an already-moved position.
+    let anchor = {
+        let mut guard = state.widget_anchor.lock().map_err(lock_err)?;
+        if guard.is_none() {
+            *guard = Some(win.outer_position().map_err(|err| err.to_string())?);
+        }
+        guard.expect("anchor set above")
+    };
+    state.widget_active.store(true, Ordering::SeqCst);
+
+    let (grow_left, new_x) = widget_grow_plan(&win, anchor, active_width);
+
+    if apply {
+        if grow_left {
+            // Move left first (still the resting size), then grow back to the right.
+            // The webview has already flipped to a right-anchored layout, so the icon
+            // lands exactly where it rested with the pill filling the space to its left.
+            let _ = win.set_position(PhysicalPosition::new(new_x, anchor.y));
+        }
+        let _ = win.set_size(LogicalSize::new(active_width, WIDGET_IDLE_SIZE));
+    }
+
+    Ok(if grow_left { "left" } else { "right" }.to_string())
+}
+
 /// Persist where the user dragged the floating icon, so it returns there next time.
+/// Ignored while the widget is expanded for the status pill: those moves are
+/// programmatic (see `set_widget_active`) and would overwrite the resting anchor.
 #[tauri::command]
 fn save_widget_position(state: State<AppState>, x: f64, y: f64) -> AppResult<()> {
+    if state.widget_active.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let mut persisted = state.inner.lock().map_err(lock_err)?;
     persisted.setup.widget_x = Some(x);
     persisted.setup.widget_y = Some(y);

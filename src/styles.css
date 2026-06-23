@@ -11,6 +11,15 @@
   --line: #e4d9c6;
   --shell: #e7dccb;
 
+  /* Motion tokens — one shared set of durations + easings so every
+     animation in the app speaks the same language. */
+  --dur-1: 120ms; /* taps, hovers */
+  --dur-2: 200ms; /* state changes */
+  --dur-3: 320ms; /* entrances, modals */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1); /* settle into place */
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1); /* pop / overshoot */
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+
   color: var(--ink);
   background: var(--paper);
   font-family:
@@ -18,6 +27,51 @@
     sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+}
+
+/* ============================================================ */
+/*  Dark theme — "Warm Ember". Keeps the clay/sage/gold accent  */
+/*  identity; only the cream surfaces swap for warm charcoal.    */
+/*  Toggled by setting data-theme="dark" on <html> (see App.tsx).*/
+/* ============================================================ */
+:root[data-theme="dark"] {
+  --paper: #14110e;
+  --shell: #100d0b;
+  --card: #1e1a16;
+  --line: #322b24;
+  --ink: #f2e9dc;
+  --ink-dim: #a3947f;
+  --clay: #e0764c;
+  --clay-soft: #f0a07a;
+  --sage: #9fae74;
+  --gold: #e6b450;
+  /* Backs the key-fingerprint chip (var has a light-mode fallback inline). */
+  --surface-2: rgba(255, 255, 255, 0.06);
+}
+
+/* A handful of spots hardcode light colors that the tokens don't reach; recolor
+   them for dark so nothing stays paper-bright on the charcoal surface. */
+:root[data-theme="dark"] .status-dot::before {
+  background: #4a4036;
+}
+
+:root[data-theme="dark"] progress,
+:root[data-theme="dark"] progress::-webkit-progress-bar {
+  background: #2a241e;
+}
+
+:root[data-theme="dark"] .titlebar-btn:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+:root[data-theme="dark"] .toast-error {
+  color: #f6c0a6;
+  background: rgba(224, 118, 76, 0.14);
+  border-color: rgba(224, 118, 76, 0.5);
+}
+
+:root[data-theme="dark"] .drop-overlay {
+  background: rgba(20, 17, 14, 0.86);
 }
 
 * {
@@ -1076,6 +1130,18 @@ progress::-moz-progress-bar {
   justify-content: center;
 }
 
+/* When the icon sits near the right edge of its monitor the backend grows the
+   window leftward, so the icon is on the right and the pill fills the space to its
+   left. Reverse the row and flip the pill's gap to match. */
+.fi-root.pill-left {
+  flex-direction: row-reverse;
+}
+
+.fi-root.pill-left .fi-status {
+  margin-right: 0;
+  margin-left: 8px;
+}
+
 /* Expanding sonar rings that radiate from the icon to draw the eye to the centre
    of the screen where the freshly enabled widget now sits. */
 .fi-radar {
@@ -1094,15 +1160,15 @@ progress::-moz-progress-bar {
   border-radius: 50%;
   border: 2px solid rgba(232, 160, 126, 0.75);
   opacity: 0;
-  animation: fi-radar 1.6s ease-out infinite;
+  animation: fi-radar 0.96s ease-out infinite;
 }
 
 .fi-radar span:nth-child(2) {
-  animation-delay: 0.53s;
+  animation-delay: 0.32s;
 }
 
 .fi-radar span:nth-child(3) {
-  animation-delay: 1.06s;
+  animation-delay: 0.64s;
 }
 
 @keyframes fi-radar {
@@ -1220,5 +1286,344 @@ progress::-moz-progress-bar {
 
   .transfer-row {
     grid-template-columns: 1fr;
+  }
+}
+
+/* ============================================================ */
+/*  Motion polish — entrances, feedback, idle "breathing".       */
+/*  Everything pulls from the --dur-* / --ease-* tokens so the    */
+/*  whole app shares one motion language.                        */
+/* ============================================================ */
+
+/* Peer tiles rise + fade in on mount, and emit a one-shot ripple
+   ring. Existing tiles never remount, so only genuinely new peers
+   animate. `backwards` fill hides them during the stagger delay and
+   then reverts to base styles, so :hover transforms keep working. */
+.device-tile {
+  animation: tileRise var(--dur-3) var(--ease-out) backwards;
+}
+
+.device-tile:nth-child(2) {
+  animation-delay: 60ms;
+}
+
+.device-tile:nth-child(3) {
+  animation-delay: 120ms;
+}
+
+.device-tile:nth-child(4) {
+  animation-delay: 180ms;
+}
+
+.device-tile:nth-child(5) {
+  animation-delay: 240ms;
+}
+
+@keyframes tileRise {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.device-tile::before {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 22px;
+  border: 2px solid var(--clay-soft);
+  opacity: 0;
+  pointer-events: none;
+  animation: tileRipple 900ms var(--ease-out);
+}
+
+@keyframes tileRipple {
+  0% {
+    transform: scale(0.85);
+    opacity: 0.6;
+  }
+  100% {
+    transform: scale(1.15);
+    opacity: 0;
+  }
+}
+
+/* Selecting a tile pops a sage check badge into the corner. */
+.tile-check {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  z-index: 2;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--sage);
+  box-shadow: 0 4px 10px rgba(60, 70, 35, 0.3);
+  animation: checkPop var(--dur-3) var(--ease-spring) both;
+}
+
+@keyframes checkPop {
+  from {
+    transform: scale(0);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* Drag target: a breathing ring (on a pseudo-element, so it never
+   disturbs the tile's own entrance animation) + a floating drop arrow. */
+.device-tile.drag-over::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 21px;
+  pointer-events: none;
+  animation: dragPulse 1.4s var(--ease-in-out) infinite;
+}
+
+@keyframes dragPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 3px rgba(200, 100, 60, 0.28);
+  }
+  50% {
+    box-shadow: 0 0 0 7px rgba(200, 100, 60, 0.12);
+  }
+}
+
+.drop-overlay svg {
+  animation: float-y 1.4s var(--ease-in-out) infinite;
+}
+
+@keyframes float-y {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-4px);
+  }
+}
+
+/* Online status dot gets a slow breathing halo — proof the link is live. */
+.status-dot.online::before {
+  animation: dot-halo 2s var(--ease-in-out) infinite;
+}
+
+@keyframes dot-halo {
+  0% {
+    box-shadow: 0 0 0 0 rgba(125, 138, 92, 0.45);
+  }
+  70%, 100% {
+    box-shadow: 0 0 0 7px rgba(125, 138, 92, 0);
+  }
+}
+
+/* Messages enter from where they come from: sent pops up from the
+   composer corner, received eases in from the peer's side. */
+.message.sent {
+  animation: msg-send var(--dur-3) var(--ease-spring) backwards;
+  transform-origin: bottom right;
+}
+
+.message.received {
+  animation: msg-recv var(--dur-3) var(--ease-out) backwards;
+  transform-origin: bottom left;
+}
+
+@keyframes msg-send {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.85);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes msg-recv {
+  from {
+    opacity: 0;
+    transform: translateX(-12px) scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* In-flight transfer bar: a sheen sweeping across the gold→clay fill. */
+progress::-webkit-progress-value {
+  background:
+    linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.7) 50%, transparent 80%),
+    linear-gradient(90deg, var(--gold), var(--clay));
+  background-size: 60% 100%, 100% 100%;
+  background-repeat: no-repeat;
+  background-position: -60% 0, 0 0;
+  animation: prog-sheen 1.2s linear infinite;
+}
+
+progress::-moz-progress-bar {
+  background:
+    linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.7) 50%, transparent 80%),
+    linear-gradient(90deg, var(--gold), var(--clay));
+  background-size: 60% 100%, 100% 100%;
+  background-repeat: no-repeat;
+  background-position: -60% 0, 0 0;
+  animation: prog-sheen 1.2s linear infinite;
+}
+
+@keyframes prog-sheen {
+  0% {
+    background-position: -60% 0, 0 0;
+  }
+  100% {
+    background-position: 160% 0, 0 0;
+  }
+}
+
+/* Completed transfer: a spring-popped check held briefly before the row drops. */
+.transfer-done {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--sage);
+  font-weight: 700;
+  font-size: 13px;
+  animation: done-pop var(--dur-3) var(--ease-spring) both;
+}
+
+@keyframes done-pop {
+  0% {
+    transform: scale(0.5);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.12);
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* Pairing / settings modals spring in over a fading backdrop. */
+.modal-backdrop {
+  animation: backdrop-in var(--dur-3) var(--ease-out);
+}
+
+@keyframes backdrop-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.pairing-panel,
+.settings-panel {
+  animation: modal-in var(--dur-3) var(--ease-spring);
+}
+
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: scale(0.9) translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Tactile button squish on press. */
+button {
+  transition: transform var(--dur-1) var(--ease-spring);
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+/* Empty discovery state: a live scanning radar around the icon. */
+.empty-state .radar {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 120px;
+  height: 120px;
+}
+
+.empty-state .radar > svg {
+  position: relative;
+  z-index: 1;
+  color: var(--clay);
+}
+
+.empty-state .radar span {
+  position: absolute;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 2px solid var(--clay-soft);
+  opacity: 0;
+  animation: radar-ping 2.4s var(--ease-out) infinite;
+}
+
+.empty-state .radar span:nth-child(2) {
+  animation-delay: 0.8s;
+}
+
+.empty-state .radar span:nth-child(3) {
+  animation-delay: 1.6s;
+}
+
+@keyframes radar-ping {
+  0% {
+    transform: scale(0.7);
+    opacity: 0.8;
+  }
+  100% {
+    transform: scale(3);
+    opacity: 0;
+  }
+}
+
+/* Empty chat: a gently breathing icon so a blank panel feels calm-alive. */
+.empty-chat > svg {
+  transform-origin: center;
+  animation: breathe-scale 2.8s var(--ease-in-out) infinite;
+}
+
+@keyframes breathe-scale {
+  0%, 100% {
+    transform: scale(0.94) translateY(1px);
+    opacity: 0.6;
+  }
+  50% {
+    transform: scale(1.08) translateY(-2px);
+    opacity: 1;
+    color: var(--clay-soft);
+  }
+}
+
+/* Respect motion-sensitivity: collapse all motion to near-instant. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
   }
 }

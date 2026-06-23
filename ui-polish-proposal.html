@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SimplePass — UI & Motion Polish Proposal</title>
+<style>
+  :root {
+    /* Pulled verbatim from src/styles.css — Warm Paper theme */
+    --paper: #f4ede1;
+    --card: #fbf7f0;
+    --ink: #3b342c;
+    --ink-dim: #8a7d6b;
+    --clay: #c8643c;
+    --clay-soft: #e8a07e;
+    --sage: #7d8a5c;
+    --gold: #d8a13a;
+    --line: #e4d9c6;
+    --shell: #e7dccb;
+
+    /* Proposed motion tokens (the "cohesion layer") */
+    --dur-1: 120ms;   /* taps, hovers */
+    --dur-2: 200ms;   /* state changes */
+    --dur-3: 320ms;   /* entrances, modals */
+    --ease-out: cubic-bezier(0.22, 1, 0.36, 1);     /* settle */
+    --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1); /* overshoot/pop */
+    --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: var(--ink);
+    background:
+      radial-gradient(circle at 12% -5%, rgba(200,100,60,0.12), transparent 40rem),
+      radial-gradient(circle at 95% 0%, rgba(125,138,92,0.10), transparent 36rem),
+      var(--shell);
+    line-height: 1.55;
+  }
+  code, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.86em;
+  }
+
+  /* ---------- layout ---------- */
+  header.hero {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 64px 28px 28px;
+  }
+  .badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 14px; border-radius: 999px;
+    background: rgba(200,100,60,0.12); color: var(--clay);
+    font-size: 12.5px; font-weight: 700; letter-spacing: 0.3px;
+    text-transform: uppercase;
+  }
+  .hero h1 {
+    margin: 18px 0 6px; font-size: 40px; font-weight: 800; letter-spacing: -1px;
+  }
+  .hero h1 .accent { color: var(--clay); }
+  .hero p.lede { margin: 0; max-width: 64ch; font-size: 17px; color: var(--ink-dim); }
+
+  main { max-width: 980px; margin: 0 auto; padding: 0 28px 120px; }
+
+  .section { margin-top: 56px; }
+  .section > h2 {
+    font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.4px;
+    color: var(--sage); margin: 0 0 4px;
+  }
+  .section > h2 + p { margin: 0 0 22px; color: var(--ink-dim); max-width: 70ch; }
+
+  /* principle chips */
+  .principles { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px,1fr)); gap: 14px; }
+  .principle {
+    padding: 18px; border: 1px solid var(--line); border-radius: 16px; background: var(--card);
+  }
+  .principle h3 { margin: 0 0 6px; font-size: 15px; }
+  .principle p { margin: 0; font-size: 13.5px; color: var(--ink-dim); }
+  .principle .k { font-size: 22px; }
+
+  /* demo card grid */
+  .demos { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 18px; }
+  .demo {
+    display: flex; flex-direction: column;
+    border: 1px solid var(--line); border-radius: 18px; background: var(--card);
+    overflow: hidden;
+    box-shadow: 0 4px 14px rgba(120,95,60,0.06);
+  }
+  .demo-stage {
+    position: relative; min-height: 178px;
+    display: grid; place-items: center;
+    padding: 22px;
+    background:
+      radial-gradient(circle at 50% 30%, rgba(255,255,255,0.6), transparent 70%),
+      var(--paper);
+    border-bottom: 1px solid var(--line);
+    overflow: hidden;
+  }
+  .demo-meta { padding: 16px 18px 18px; }
+  .demo-meta .tag {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase;
+    color: var(--gold);
+  }
+  .demo-meta h3 { margin: 4px 0 6px; font-size: 16px; }
+  .demo-meta p { margin: 0 0 10px; font-size: 13px; color: var(--ink-dim); }
+  .demo-meta .where {
+    font-size: 12px; color: var(--ink-dim);
+    border-top: 1px dashed var(--line); padding-top: 9px;
+  }
+  .demo-meta .where b { color: var(--ink); font-weight: 600; }
+
+  .replay {
+    align-self: flex-start; margin-top: 2px;
+    display: inline-flex; align-items: center; gap: 6px;
+    min-height: 30px; padding: 0 12px; border: 1px solid var(--clay);
+    border-radius: 10px; background: transparent; color: var(--clay);
+    font: inherit; font-size: 12.5px; font-weight: 700; cursor: pointer;
+    transition: background var(--dur-1) var(--ease-out), transform var(--dur-1) var(--ease-out);
+  }
+  .replay:hover { background: rgba(200,100,60,0.10); }
+  .replay:active { transform: scale(0.95); }
+
+  /* ===== shared demo primitives (mini versions of real components) ===== */
+  .mini-tile {
+    width: 130px; padding: 16px 12px; border: 1px solid var(--line); border-radius: 16px;
+    background: var(--card); display: grid; justify-items: center; gap: 6px; text-align: center;
+    box-shadow: 0 4px 14px rgba(120,95,60,0.06);
+  }
+  .mini-avatar {
+    width: 52px; height: 52px; border-radius: 16px; display: grid; place-items: center; color:#fff;
+    background: linear-gradient(135deg, var(--clay-soft), var(--clay));
+  }
+  .mini-tile .nm { font-size: 13px; font-weight: 700; }
+  .dot { display:inline-flex; align-items:center; gap:6px; font-size:11px; font-weight:600; color: var(--sage); }
+  .dot::before { content:""; width:8px;height:8px;border-radius:50%;background: var(--sage); }
+
+  .bubble {
+    max-width: 80%; padding: 10px 13px; border-radius: 16px; font-size: 13px;
+    border: 1px solid var(--line); background: var(--card); border-bottom-left-radius: 5px;
+  }
+  .bubble.sent { color:#fff; background: var(--clay); border:0; border-bottom-right-radius:5px; border-bottom-left-radius:16px; align-self:flex-end; }
+
+  .pill-btn {
+    min-height: 36px; padding: 0 16px; border-radius: 12px; font-weight:700; color:#fff;
+    background: var(--clay); border:0; cursor:pointer; font: inherit; font-weight:700;
+  }
+
+  svg.mark { display:block; }
+
+  /* ============================================================= */
+  /*  ANIMATION KEYFRAMES — the actual proposals                   */
+  /* ============================================================= */
+
+  /* 1. Peer tile entrance — staggered rise + fade */
+  .anim-enter .mini-tile { animation: tileRise var(--dur-3) var(--ease-out) both; }
+  .anim-enter .mini-tile:nth-child(2) { animation-delay: 90ms; }
+  .anim-enter .mini-tile:nth-child(3) { animation-delay: 180ms; }
+  @keyframes tileRise {
+    from { opacity: 0; transform: translateY(14px) scale(0.96); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  /* 2. New peer "pops" into existence with a ring ripple */
+  .ring-ripple { position: relative; }
+  .ring-ripple .ripple {
+    position: absolute; inset: -6px; border-radius: 20px; border: 2px solid var(--clay-soft);
+    opacity: 0; animation: ripple 900ms var(--ease-out);
+  }
+  @keyframes ripple {
+    0% { transform: scale(0.8); opacity: 0.9; }
+    100% { transform: scale(1.5); opacity: 0; }
+  }
+  .anim-pop .mini-tile { animation: popIn 420ms var(--ease-spring) both; }
+  @keyframes popIn {
+    from { opacity:0; transform: scale(0.6); }
+    to { opacity:1; transform: scale(1); }
+  }
+
+  /* 3. Live discovery radar (idle scanning state) */
+  .radar-wrap { position: relative; width: 120px; height: 120px; display:grid; place-items:center; }
+  .radar-wrap .r {
+    position:absolute; inset:0; margin:auto; width:36px; height:36px; border-radius:50%;
+    border: 2px solid var(--clay-soft); opacity:0; animation: radar 2.4s ease-out infinite;
+  }
+  .radar-wrap .r:nth-child(2){ animation-delay:.8s; }
+  .radar-wrap .r:nth-child(3){ animation-delay:1.6s; }
+  @keyframes radar { 0%{transform:scale(0.7);opacity:.8} 100%{transform:scale(3);opacity:0} }
+  .radar-core { width:44px;height:44px;border-radius:14px;display:grid;place-items:center;color:#fff;
+    background:linear-gradient(135deg,var(--clay-soft),var(--clay)); z-index:1; }
+
+  /* 4. Status dot — online breathing halo */
+  .pulse-dot { position: relative; width: 12px; height:12px; border-radius:50%; background: var(--sage); }
+  .pulse-dot::after {
+    content:""; position:absolute; inset:0; border-radius:50%; background: var(--sage);
+    animation: breathe 2s var(--ease-in-out) infinite;
+  }
+  @keyframes breathe { 0%{transform:scale(1);opacity:.55} 70%,100%{transform:scale(2.6);opacity:0} }
+
+  /* 5. Selection — spring check */
+  .anim-select .mini-tile { animation: selectPop 360ms var(--ease-spring) both;
+    border-color: var(--clay); box-shadow: 0 0 0 2px rgba(200,100,60,0.25), 0 12px 28px rgba(120,95,60,0.14); }
+  @keyframes selectPop { 0%{transform:scale(1)} 40%{transform:scale(1.06)} 100%{transform:scale(1)} }
+  .check-badge {
+    position:absolute; top:-8px; right:-8px; width:26px;height:26px;border-radius:50%;
+    background: var(--sage); color:#fff; display:grid; place-items:center;
+    animation: checkPop 360ms var(--ease-spring) both;
+  }
+  @keyframes checkPop { from{transform:scale(0);opacity:0} to{transform:scale(1);opacity:1} }
+
+  /* 6. Drag target glow (continuous) */
+  .drag-tile { position: relative; }
+  .anim-drag .drag-tile {
+    border-color: var(--clay);
+    animation: dragGlow 1.4s var(--ease-in-out) infinite;
+  }
+  @keyframes dragGlow {
+    0%,100% { box-shadow: 0 0 0 3px rgba(200,100,60,0.18), 0 12px 28px rgba(120,95,60,0.18); transform: translateY(-3px); }
+    50% { box-shadow: 0 0 0 6px rgba(200,100,60,0.34), 0 16px 34px rgba(120,95,60,0.24); transform: translateY(-5px); }
+  }
+  /* Centered overlay inside the tile — mirrors the real .drop-overlay in styles.css */
+  .drop-overlay-mini {
+    position:absolute; inset:0; display:grid; place-items:center; align-content:center; gap:6px;
+    border-radius:16px; color:var(--clay); font-weight:700; font-size:12px;
+    background: rgba(244,237,225,0.86);
+  }
+  .drop-overlay-mini .arrow { animation: floatY 1.4s var(--ease-in-out) infinite; font-size:20px; }
+  @keyframes floatY { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-4px)} }
+
+  /* 7. Message send — pop from composer */
+  .anim-msg-sent .bubble.sent { animation: msgSend 360ms var(--ease-spring) both; transform-origin: bottom right; }
+  @keyframes msgSend { from{opacity:0; transform: translateY(8px) scale(0.85)} to{opacity:1;transform:none} }
+  /* 8. Message receive — slide from left */
+  .anim-msg-recv .bubble:not(.sent) { animation: msgRecv 340ms var(--ease-out) both; transform-origin: bottom left; }
+  @keyframes msgRecv { from{opacity:0; transform: translateX(-12px) scale(0.92)} to{opacity:1;transform:none} }
+
+  /* 9. Transfer progress shimmer + fill */
+  .prog { width: 200px; height: 10px; border-radius: 999px; background:#ece3d3; overflow:hidden; position:relative; }
+  .prog .fill {
+    display:block; height:100%; width: 0%; border-radius:999px;
+    background: linear-gradient(90deg, var(--gold), var(--clay));
+    position: relative;
+  }
+  /* Fill grows as a keyframe (not a transition) so it restarts cleanly on replay. */
+  .anim-progress .fill { animation: fillGrow 2.4s var(--ease-in-out) forwards; }
+  @keyframes fillGrow { from { width:0%; } to { width:100%; } }
+  /* Moving sheen — its own independent infinite loop, always sweeping. */
+  .prog .fill::after {
+    content:""; position:absolute; inset:0;
+    background: linear-gradient(100deg, transparent 20%, rgba(255,255,255,0.75) 50%, transparent 80%);
+    background-size: 60% 100%; background-repeat: no-repeat;
+    animation: shimmer 1.2s linear infinite;
+  }
+  @keyframes shimmer { 0%{background-position:-60% 0} 100%{background-position:160% 0} }
+
+  /* 10. Transfer complete — checkmark draw + sage flash */
+  .done-circle { width:56px;height:56px;border-radius:50%;display:grid;place-items:center;
+    background: rgba(125,138,92,0.16); }
+  .done-circle svg { width:30px;height:30px; }
+  .anim-done .done-circle { animation: donePop 480ms var(--ease-spring) both; }
+  @keyframes donePop { 0%{transform:scale(0.4);opacity:0} 60%{transform:scale(1.12)} 100%{transform:scale(1);opacity:1} }
+  .anim-done .check-path { stroke-dasharray: 30; stroke-dashoffset: 30; animation: draw 420ms 160ms var(--ease-out) forwards; }
+  @keyframes draw { to { stroke-dashoffset: 0; } }
+  .spark { position:absolute; width:6px;height:6px;border-radius:50%;background:var(--gold); opacity:0; }
+  .anim-done .spark { animation: spark 620ms var(--ease-out) forwards; }
+  .anim-done .spark:nth-child(1){ --tx:-46px; --ty:-30px; animation-delay:.18s; }
+  .anim-done .spark:nth-child(2){ --tx:48px; --ty:-26px; animation-delay:.22s; background:var(--clay); }
+  .anim-done .spark:nth-child(3){ --tx:-38px; --ty:34px; animation-delay:.26s; background:var(--sage); }
+  .anim-done .spark:nth-child(4){ --tx:42px; --ty:36px; animation-delay:.2s; }
+  @keyframes spark { 0%{opacity:1;transform:translate(0,0) scale(1)} 100%{opacity:0;transform:translate(var(--tx),var(--ty)) scale(0.3)} }
+
+  /* 11. Pairing modal — scale-in + backdrop blur */
+  .modal-demo { position:relative; width:100%; height:100%; display:grid; place-items:center; }
+  .modal-card {
+    width: 200px; padding: 18px; border-radius: 18px; background: var(--card); border:1px solid var(--line);
+    text-align:center; box-shadow: 0 24px 50px rgba(60,45,28,0.26);
+  }
+  .anim-modal .modal-card { animation: modalIn 360ms var(--ease-spring) both; }
+  @keyframes modalIn { from{opacity:0; transform: scale(0.88) translateY(10px)} to{opacity:1;transform:none} }
+  .modal-card .mini-avatar { margin: 0 auto 8px; width:44px;height:44px;border-radius:14px; }
+  .modal-card .row { display:flex; gap:8px; margin-top:12px; }
+  .modal-card .row button { flex:1; min-height:32px; border-radius:10px; font-weight:700; font:inherit; font-weight:700; cursor:pointer; }
+  .modal-card .deny { background:transparent; border:1.5px solid var(--clay); color:var(--clay); }
+  .modal-card .acc { background: var(--clay); border:0; color:#fff; }
+
+  /* 12. Button press ripple + tactile squish */
+  .squish:active { transform: scale(0.94); }
+  .squish { transition: transform var(--dur-1) var(--ease-spring); position:relative; overflow:hidden; }
+  .btn-ripple { position:absolute; border-radius:50%; background:rgba(255,255,255,0.5); transform: translate(-50%,-50%) scale(0); pointer-events:none; animation: btnRipple 600ms var(--ease-out); }
+  @keyframes btnRipple { to { transform: translate(-50%,-50%) scale(6); opacity:0; } }
+
+  /* 13. Toast slide-in */
+  .toast {
+    display:flex; align-items:center; gap:10px; padding:11px 14px; border-radius:14px;
+    background:#fdf0e8; border:1px solid var(--clay-soft); color:#7a3320; font-size:13px; font-weight:600;
+    box-shadow: 0 18px 42px rgba(90,50,30,0.18);
+  }
+  .anim-toast .toast { animation: toastIn 420ms var(--ease-spring) both; }
+  @keyframes toastIn { from{opacity:0; transform: translateY(20px) scale(0.9)} to{opacity:1;transform:none} }
+
+  /* 14. Empty-state breathing icon */
+  .breathe-icon { color: var(--ink-dim); transform-origin: center; animation: breatheScale 2.8s var(--ease-in-out) infinite; }
+  @keyframes breatheScale {
+    0%,100% { transform: scale(0.92) translateY(2px); opacity: .55; color: var(--ink-dim); }
+    50%     { transform: scale(1.12) translateY(-2px); opacity: 1; color: var(--clay-soft); }
+  }
+
+  /* 15. Typing indicator (already exists — shown for reference) */
+  .typing { display:inline-flex; gap:5px; padding:13px 16px; background:var(--card); border:1px solid var(--line); border-radius:16px; border-bottom-left-radius:5px; }
+  .typing i { width:7px;height:7px;border-radius:50%;background:var(--ink-dim); animation: tb 1.2s infinite ease-in-out; }
+  .typing i:nth-child(2){animation-delay:.18s} .typing i:nth-child(3){animation-delay:.36s}
+  @keyframes tb { 0%,60%,100%{transform:translateY(0);opacity:.45} 30%{transform:translateY(-4px);opacity:1} }
+
+  /* motion token table */
+  .tokens { width:100%; border-collapse: collapse; background: var(--card); border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+  .tokens th, .tokens td { text-align:left; padding: 11px 14px; border-bottom:1px solid var(--line); font-size:13.5px; }
+  .tokens th { background: var(--paper); font-size:12px; text-transform:uppercase; letter-spacing:0.5px; color:var(--ink-dim); }
+  .tokens tr:last-child td { border-bottom:0; }
+  .swatch-bar { display:inline-block; width:90px; height:8px; border-radius:999px; vertical-align:middle; }
+
+  /* roadmap */
+  .roadmap { display:grid; gap:12px; }
+  .phase { border:1px solid var(--line); border-radius:16px; background:var(--card); padding:18px 20px; }
+  .phase h3 { margin:0 0 4px; font-size:15px; display:flex; align-items:center; gap:10px; }
+  .phase .num { width:24px;height:24px;border-radius:8px;display:grid;place-items:center;color:#fff;font-size:12px;font-weight:800; background:var(--clay); }
+  .phase ul { margin:8px 0 0; padding-left: 20px; color:var(--ink-dim); font-size:13.5px; }
+  .phase ul li { margin-bottom: 3px; }
+  .effort { font-size:11px; font-weight:700; color:var(--sage); background:rgba(125,138,92,0.14); padding:3px 9px; border-radius:999px; margin-left:auto; }
+
+  .note { font-size:12.5px; color:var(--ink-dim); margin-top:10px; }
+  .note code { background: rgba(0,0,0,0.05); padding:1px 6px; border-radius:6px; }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <span class="badge">● Motion & UI Proposal</span>
+  <h1>Make Simple<span class="accent">Pass</span> feel <span class="accent">alive</span></h1>
+  <p class="lede">
+    The app is feature-complete but static — nothing acknowledges what the user does.
+    This is a working catalog of motion + UI ideas, every demo running live in your real
+    Warm&nbsp;Paper palette. Click any tile to replay. Hover, click, drag mentally — then
+    pick what ships. Nothing here is wired into the app yet.
+  </p>
+</header>
+
+<main>
+
+  <!-- ===================== PRINCIPLES ===================== -->
+  <section class="section">
+    <h2>Design principles</h2>
+    <p>Four rules so motion feels intentional, not decorative. Everything below obeys these.</p>
+    <div class="principles">
+      <div class="principle">
+        <div class="k">⚡</div>
+        <h3>React to every act</h3>
+        <p>Tap, send, drop, pair — each gets an instant visual reply under 400ms. Silence reads as "broken".</p>
+      </div>
+      <div class="principle">
+        <div class="k">🌬️</div>
+        <h3>Warm & organic</h3>
+        <p>Spring easing with a touch of overshoot, never robotic linear. Matches the soft clay aesthetic.</p>
+      </div>
+      <div class="principle">
+        <div class="k">🎯</div>
+        <h3>Motion = meaning</h3>
+        <p>Things enter from where they come from. Sent messages pop from the composer; peers ripple in from the network.</p>
+      </div>
+      <div class="principle">
+        <div class="k">🪶</div>
+        <h3>Calm at rest</h3>
+        <p>Idle = subtle breathing only (status halo, scanning radar). No spinning, no noise when nothing's happening.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== DISCOVERY / PEERS ===================== -->
+  <section class="section">
+    <h2>Discovery &amp; peer grid</h2>
+    <p>The peer grid is the home screen — it should feel like a living radar, not a static list.</p>
+    <div class="demos">
+
+      <!-- 1 entrance -->
+      <div class="demo">
+        <div class="demo-stage anim-enter" data-anim>
+          <div style="display:flex; gap:12px;">
+            <div class="mini-tile"><div class="mini-avatar">🖥️</div><span class="nm">Studio</span><span class="dot">online</span></div>
+            <div class="mini-tile"><div class="mini-avatar">💻</div><span class="nm">Laptop</span><span class="dot">online</span></div>
+          </div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Entrance</span>
+          <h3>Staggered tile rise</h3>
+          <p>On first load tiles fade up in sequence instead of snapping in. Gives the grid a sense of assembling.</p>
+          <button class="replay" data-replay>↻ Replay</button>
+          <div class="where" style="margin-top:10px;">Applies to <b>.device-grid</b> on mount &amp; re-render.</div>
+        </div>
+      </div>
+
+      <!-- 2 new peer pop -->
+      <div class="demo">
+        <div class="demo-stage anim-pop" data-anim>
+          <div class="ring-ripple">
+            <span class="ripple"></span>
+            <div class="mini-tile"><div class="mini-avatar">📱</div><span class="nm">New device</span><span class="dot">online</span></div>
+          </div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Arrival</span>
+          <h3>Peer pops onto network</h3>
+          <p>When a UDP announce adds a peer, it springs in with an expanding ring — "someone just joined".</p>
+          <button class="replay" data-replay>↻ Replay</button>
+          <div class="where" style="margin-top:10px;">Fires when <b>onPeersChanged</b> adds an id.</div>
+        </div>
+      </div>
+
+      <!-- 3 radar idle -->
+      <div class="demo">
+        <div class="demo-stage" data-anim>
+          <div class="radar-wrap">
+            <span class="r"></span><span class="r"></span><span class="r"></span>
+            <div class="radar-core">📡</div>
+          </div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Idle state</span>
+          <h3>Scanning radar (empty state)</h3>
+          <p>Replace the flat "Looking for computers…" with a gentle live sonar. Communicates "actively searching".</p>
+          <div class="where" style="margin-top:10px;">Replaces static <b>.empty-state</b> icon.</div>
+        </div>
+      </div>
+
+      <!-- 4 status halo -->
+      <div class="demo">
+        <div class="demo-stage" data-anim>
+          <div style="display:flex; align-items:center; gap:18px;">
+            <div style="display:flex; align-items:center; gap:8px;"><span class="pulse-dot"></span><span style="font-size:13px;font-weight:600;color:var(--sage)">online</span></div>
+          </div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Liveness</span>
+          <h3>Breathing online dot</h3>
+          <p>Online status dot gets a slow halo pulse — proof the connection is live, not a frozen UI.</p>
+          <div class="where" style="margin-top:10px;">Enhances <b>.status-dot.online</b>.</div>
+        </div>
+      </div>
+
+      <!-- 5 selection -->
+      <div class="demo">
+        <div class="demo-stage anim-select" data-anim>
+          <div class="mini-tile" style="position:relative;">
+            <span class="check-badge">✓</span>
+            <div class="mini-avatar">🖥️</div><span class="nm">Studio</span><span class="dot">online</span>
+          </div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Feedback</span>
+          <h3>Spring select + check badge</h3>
+          <p>Selecting a tile bounces it and pops a corner check. Multi-select for group-send feels deliberate.</p>
+          <button class="replay" data-replay>↻ Replay</button>
+          <div class="where" style="margin-top:10px;">Enhances <b>.device-tile.selected</b>.</div>
+        </div>
+      </div>
+
+      <!-- 6 drag target -->
+      <div class="demo">
+        <div class="demo-stage anim-drag" data-anim>
+          <div class="mini-tile drag-tile">
+            <div class="mini-avatar">💻</div><span class="nm">Laptop</span><span class="dot">online</span>
+            <div class="drop-overlay-mini"><span class="arrow">⬇</span>Drop to send</div>
+          </div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Drag &amp; drop</span>
+          <h3>Pulsing drop target</h3>
+          <p>While files hover a tile, its ring breathes and a hint floats — currently it's a static outline.</p>
+          <div class="where" style="margin-top:10px;">Enhances <b>.device-tile.drag-over</b>.</div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ===================== CHAT ===================== -->
+  <section class="section">
+    <h2>Chat &amp; messaging</h2>
+    <p>Messages currently just appear. Give them direction so a conversation feels like a back-and-forth.</p>
+    <div class="demos">
+
+      <!-- 7 sent -->
+      <div class="demo">
+        <div class="demo-stage anim-msg-sent" data-anim>
+          <div style="display:flex; flex-direction:column; gap:8px; width:100%;">
+            <div class="bubble">Hey, sending the file now</div>
+            <div class="bubble sent">On it 👍</div>
+          </div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Outgoing</span>
+          <h3>Sent message pops from composer</h3>
+          <p>Your message springs up from the bottom-right, anchored to where you typed it.</p>
+          <button class="replay" data-replay>↻ Replay</button>
+          <div class="where" style="margin-top:10px;">New <b>.message.sent</b> in <b>.message-list</b>.</div>
+        </div>
+      </div>
+
+      <!-- 8 received -->
+      <div class="demo">
+        <div class="demo-stage anim-msg-recv" data-anim>
+          <div style="display:flex; flex-direction:column; gap:8px; width:100%;">
+            <div class="bubble">Got it — thanks!</div>
+          </div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Incoming</span>
+          <h3>Received slides in from peer</h3>
+          <p>Inbound messages ease in from the left edge. Subtly different from sent → the eye reads who's talking.</p>
+          <button class="replay" data-replay>↻ Replay</button>
+          <div class="where" style="margin-top:10px;">New received <b>.message</b> via <b>onMessage</b>.</div>
+        </div>
+      </div>
+
+      <!-- 15 typing (existing) -->
+      <div class="demo">
+        <div class="demo-stage" data-anim>
+          <div class="typing"><i></i><i></i><i></i></div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Already shipped ✓</span>
+          <h3>Typing indicator</h3>
+          <p>You already have this — keep it. Good baseline for the motion language used everywhere else.</p>
+          <div class="where" style="margin-top:10px;">Existing <b>.typing-bubble</b>.</div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ===================== TRANSFERS ===================== -->
+  <section class="section">
+    <h2>File transfers</h2>
+    <p>The transfer dock is where SimplePass earns trust — make progress feel fast and completion feel rewarding.</p>
+    <div class="demos">
+
+      <!-- 9 progress -->
+      <div class="demo">
+        <div class="demo-stage anim-progress" data-anim>
+          <div style="text-align:center;">
+            <div class="prog"><span class="fill"></span></div>
+            <div style="font-size:12px;color:var(--ink-dim);margin-top:10px;">vacation.zip · 64%</div>
+          </div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">In flight</span>
+          <h3>Shimmering progress fill</h3>
+          <p>Animated gold→clay gradient with a moving sheen, so an active transfer reads as energetic, not stalled.</p>
+          <button class="replay" data-replay>↻ Replay</button>
+          <div class="where" style="margin-top:10px;">Enhances <b>.transfer-row progress</b>.</div>
+        </div>
+      </div>
+
+      <!-- 10 complete -->
+      <div class="demo">
+        <div class="demo-stage anim-done" data-anim>
+          <div style="position:relative; display:grid; place-items:center;">
+            <span class="spark"></span><span class="spark"></span><span class="spark"></span><span class="spark"></span>
+            <div class="done-circle">
+              <svg viewBox="0 0 24 24" fill="none"><path class="check-path" d="M5 12.5l4.5 4.5L19 7" stroke="var(--sage)" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </div>
+          </div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Success</span>
+          <h3>Completion checkmark + sparks</h3>
+          <p>On a finished transfer the bar morphs into a drawn check with a tiny burst. A reward beat = "fun to use".</p>
+          <button class="replay" data-replay>↻ Replay</button>
+          <div class="where" style="margin-top:10px;">On <b>transfer.state === "complete"</b> before the row drops.</div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ===================== SYSTEM / FEEDBACK ===================== -->
+  <section class="section">
+    <h2>Modals, toasts &amp; micro-interactions</h2>
+    <p>The small stuff that makes the whole thing feel hand-built.</p>
+    <div class="demos">
+
+      <!-- 11 modal -->
+      <div class="demo">
+        <div class="demo-stage anim-modal" data-anim style="background: rgba(60,45,28,0.18);">
+          <div class="modal-demo">
+            <div class="modal-card">
+              <div class="mini-avatar">💻</div>
+              <div style="font-size:14px;font-weight:700;">Laptop wants to pair</div>
+              <div class="row"><button class="deny">Deny</button><button class="acc">Accept</button></div>
+            </div>
+          </div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Modal</span>
+          <h3>Pairing modal springs in</h3>
+          <p>Backdrop dims, card scales up with overshoot. Pairing is the key trust moment — it should feel weighty.</p>
+          <button class="replay" data-replay>↻ Replay</button>
+          <div class="where" style="margin-top:10px;">Wrap <b>.pairing-panel</b> / <b>.modal-backdrop</b>.</div>
+        </div>
+      </div>
+
+      <!-- 13 toast -->
+      <div class="demo">
+        <div class="demo-stage anim-toast" data-anim>
+          <div class="toast">⚠️ Couldn't reach Laptop <button style="margin-left:6px;min-height:26px;border-radius:8px;padding:0 10px;font-weight:700;color:#fff;background:var(--clay);border:0;font:inherit;font-weight:700;">Dismiss</button></div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Toast</span>
+          <h3>Error toast slides up</h3>
+          <p>Bottom-right toast springs in instead of blinking on. Auto-dismiss after a few seconds with a fade.</p>
+          <button class="replay" data-replay>↻ Replay</button>
+          <div class="where" style="margin-top:10px;">Enhances <b>.toast-error</b>.</div>
+        </div>
+      </div>
+
+      <!-- 12 button -->
+      <div class="demo">
+        <div class="demo-stage" data-anim>
+          <button class="pill-btn squish" id="rippleBtn">Send</button>
+          <div style="position:absolute;bottom:14px;font-size:12px;font-weight:700;color:var(--ink-dim);">↑ click me</div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Micro-interaction</span>
+          <h3>Tactile button press</h3>
+          <p>Buttons squish on press and emit a soft ripple from the click point. Cheap, universal, satisfying.</p>
+          <div class="where" style="margin-top:10px;">Global on <b>.primary</b>, <b>.tile-actions button</b>, etc.</div>
+        </div>
+      </div>
+
+      <!-- 14 empty breathe -->
+      <div class="demo">
+        <div class="demo-stage" data-anim>
+          <div style="text-align:center;">
+            <svg class="breathe-icon mark" width="46" height="46" viewBox="0 0 24 24" fill="none"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" stroke="currentColor" stroke-width="1.6"/></svg>
+            <div style="font-size:12px;color:var(--ink-dim);margin-top:8px;">Select a computer to chat</div>
+          </div>
+        </div>
+        <div class="demo-meta">
+          <span class="tag">Idle state</span>
+          <h3>Breathing empty-chat icon</h3>
+          <p>Empty chat / empty grid icons gently scale so blank screens feel calm-alive, not abandoned.</p>
+          <div class="where" style="margin-top:10px;">Enhances <b>.empty-chat</b>, <b>.empty-state</b>.</div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ===================== MOTION TOKENS ===================== -->
+  <section class="section">
+    <h2>Cohesion layer — motion tokens</h2>
+    <p>The reason it'll feel "designed" not "decorated": every animation pulls from one shared set of durations and easings. Drop these into <code>:root</code> in <code>styles.css</code> and reuse everywhere.</p>
+    <table class="tokens">
+      <tr><th>Token</th><th>Value</th><th>Use for</th></tr>
+      <tr><td class="mono">--dur-1</td><td>120ms</td><td>Hovers, taps, button squish</td></tr>
+      <tr><td class="mono">--dur-2</td><td>200ms</td><td>State changes, selections</td></tr>
+      <tr><td class="mono">--dur-3</td><td>320ms</td><td>Entrances, modals, message in</td></tr>
+      <tr><td class="mono">--ease-out</td><td>cubic-bezier(.22,1,.36,1)</td><td>Settling into place</td></tr>
+      <tr><td class="mono">--ease-spring</td><td>cubic-bezier(.34,1.56,.64,1)</td><td>Pops, the "alive" overshoot</td></tr>
+    </table>
+    <p class="note">All demos here already use these five tokens — that's why nothing feels out of place. Also: everything is wrapped in <code>@media (prefers-reduced-motion: reduce)</code> so motion-sensitive users get instant transitions. Ship that guard from day one.</p>
+  </section>
+
+  <!-- ===================== ROADMAP ===================== -->
+  <section class="section">
+    <h2>Suggested rollout</h2>
+    <p>Ordered by impact-per-effort. Phase 1 alone kills the "static" feeling.</p>
+    <div class="roadmap">
+      <div class="phase">
+        <h3><span class="num">1</span> Quick wins — pure CSS, no logic <span class="effort">~½ day</span></h3>
+        <ul>
+          <li>Motion tokens in <code>:root</code></li>
+          <li>Button squish + tile hover already half-there → standardize</li>
+          <li>Message send/receive entrance animations</li>
+          <li>Online dot breathing halo + shimmer on progress bars</li>
+          <li><code>prefers-reduced-motion</code> guard</li>
+        </ul>
+      </div>
+      <div class="phase">
+        <h3><span class="num">2</span> Reactive moments — small JS hooks <span class="effort">~1 day</span></h3>
+        <ul>
+          <li>Peer pop-in / ripple when <code>onPeersChanged</code> adds an id (diff old vs new list)</li>
+          <li>Staggered grid entrance on mount</li>
+          <li>Spring-select + check badge on tile selection</li>
+          <li>Pairing modal & toast spring-in</li>
+        </ul>
+      </div>
+      <div class="phase">
+        <h3><span class="num">3</span> Delight — the "fun" layer <span class="effort">~1 day</span></h3>
+        <ul>
+          <li>Transfer-complete checkmark draw + spark burst</li>
+          <li>Scanning radar empty state</li>
+          <li>Pulsing drag-drop targets with floating hint</li>
+          <li>Optional: subtle sound cue on send / receive (toggle in Settings)</li>
+        </ul>
+      </div>
+    </div>
+    <p class="note">Recommended lib if you want orchestration beyond CSS: <code>framer-motion</code> (now <code>motion</code>) handles list add/remove enter+exit and layout shifts cleanly — ideal for the peer grid and message list. But Phases 1 &amp; most of 2 are doable in plain CSS + a few class toggles, zero new deps.</p>
+  </section>
+
+  <p style="text-align:center; margin-top:60px; color:var(--ink-dim); font-size:13px;">
+    Tell me which demos to keep — I'll wire the chosen ones into <code>App.tsx</code> + <code>styles.css</code>.
+  </p>
+
+</main>
+
+<script>
+  // Restart a stage's entrance by yanking + re-adding its anim- class (forces a
+  // reflow so the keyframe replays from frame 0).
+  function restart(stage) {
+    var cls = Array.from(stage.classList).find(function (c) { return c.indexOf('anim-') === 0; });
+    if (!cls) return;
+    stage.classList.remove(cls);
+    void stage.offsetWidth; // reflow
+    stage.classList.add(cls);
+  }
+
+  // Replay buttons.
+  document.querySelectorAll('[data-replay]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      restart(btn.closest('.demo').querySelector('[data-anim]'));
+    });
+  });
+
+  // Auto-loop the progress bar so the fill keeps refilling on its own.
+  (function () {
+    var stage = Array.from(document.querySelectorAll('.demo-stage')).find(function (s) { return s.querySelector('.prog'); });
+    if (!stage) return;
+    setInterval(function () { restart(stage); }, 3000);
+  })();
+
+  // Button ripple from click point.
+  var rb = document.getElementById('rippleBtn');
+  if (rb) rb.addEventListener('click', function (e) {
+    var r = rb.getBoundingClientRect();
+    var s = document.createElement('span');
+    s.className = 'btn-ripple';
+    s.style.left = (e.clientX - r.left) + 'px';
+    s.style.top = (e.clientY - r.top) + 'px';
+    s.style.width = s.style.height = '20px';
+    rb.appendChild(s);
+    setTimeout(function () { s.remove(); }, 600);
+  });
+</script>
+
+</body>
+</html>
