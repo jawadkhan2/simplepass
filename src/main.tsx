@@ -13,6 +13,19 @@ const isWidget = getCurrentWindow().label === "widget";
 // background is dropped and only the floating icon paints.
 if (isWidget) document.documentElement.classList.add("widget-mode");
 
+// Paint the cached color theme before React mounts so a dark-theme user never
+// sees a light flash on launch. App.tsx re-applies the authoritative value once
+// the persisted setup loads, and refreshes this cache.
+if (!isWidget) {
+  try {
+    if (localStorage.getItem("sp-theme") === "dark") {
+      document.documentElement.dataset.theme = "dark";
+    }
+  } catch {
+    // Storage unavailable: fall back to the default light theme.
+  }
+}
+
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>{isWidget ? <FloatingIcon /> : <App />}</React.StrictMode>
 );

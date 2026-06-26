@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { LogicalSize } from "@tauri-apps/api/dpi";
 import { Check, Download, X } from "lucide-react";
 import { api, events } from "./tauri";
 import type { PeerDevice, TransferProgress } from "./types";
@@ -9,9 +9,14 @@ import "./styles.css";
 // Pixels of pointer travel before a press is treated as a drag rather than a click.
 const DRAG_THRESHOLD = 4;
 
-// The widget window is square at rest and grows sideways to show a status pill
-// while a drop is in flight or its result is being reported.
-const IDLE_SIZE = 72;
+// Native window moves during a browser drag can briefly report "left the
+// webview", especially when the widget grows left and its top-left changes.
+const DRAG_LEAVE_GRACE_MS = 250;
+
+// Width (logical px) the widget window grows to while showing a status pill during
+// a drop / send / result. The backend (`set_widget_active`) handles the resize and,
+// near a screen edge, the reposition so the pill stays on-screen; at rest the window
+// is the square WIDGET_IDLE_SIZE. Keep in sync with the backend's idle size.
 const ACTIVE_WIDTH = 252;
 
 // How long the radar pulse plays before the window collapses back to the resting
@@ -105,8 +110,13 @@ function extractDroppedText(data: DataTransfer | null): string | null {
 // pointer actually moves; if it never moves, mouseup is a click.
 export default function FloatingIcon() {
   const press = useRef<{ x: number; y: number; dragging: boolean } | null>(null);
+  const iconRef = useRef<HTMLButtonElement | null>(null);
   const [feedback, setFeedback] = useState<Feedback>({ kind: "idle" });
   const [radar, setRadar] = useState(false);
+  // Which side of the icon the status pill expands toward. The backend decides
+  // based on the room left on the widget's current monitor and returns the side so
+  // the layout can flip (icon stays put; pill grows into the available space).
+  const [side, setSide] = useState<"left" | "right">("right");
 
   // Live state for the once-mounted drop/transfer listeners (avoids stale closures).
   const batch = useRef<Batch | null>(null);
@@ -114,6 +124,10 @@ export default function FloatingIcon() {
   const locked = useRef(false); // a send is in flight or its result is on screen
   const targetName = useRef<string | null>(null);
   const resetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dragLeaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Last expanded/collapsed state pushed to the backend, so repeated feedback
+  // transitions don't re-issue the window move that causes flicker (see setActive).
+  const activeApplied = useRef(false);
 
   // Persist the window position whenever the user drops it somewhere new, so the
   // widget reappears in place on the next launch.
@@ -172,13 +186,71 @@ export default function FloatingIcon() {
   // DOM drag-drop (files, links, text) plus the transfer-progress stream (which
   // reports whether a file send succeeded). All set up once.
   useEffect(() => {
-    function setActive(active: boolean) {
-      void getCurrentWindow()
-        .setSize(new LogicalSize(active ? ACTIVE_WIDTH : IDLE_SIZE, IDLE_SIZE))
-        .catch(() => undefined);
+    // Grow/shrink the widget window for the status pill. The backend resizes (and,
+    // near a screen edge, repositions) the window so the pill never lands off-screen
+    // on any monitor, and tells us which side it placed the pill on.
+    //
+    // A single drop drives several feedback states (dragover → sending → result),
+    // each calling setActive(true). Only the transition into/out of the expanded
+    // state should touch the window — re-calling on every state change makes a
+    // left-growing window jump repeatedly (visible flicker). Guard on the last
+    // applied state so repeats are no-ops.
+    //
+    // For a leftward grow the window moves, and the layout must flip (icon to the
+    // right, pill to its left). If we flipped *after* the move, the icon would flash
+    // on the wrong side for a frame. So: decide the side first (no window change),
+    // commit the DOM flip synchronously with flushSync, then apply the move — the
+    // window only ever paints with the icon already on its final side.
+    async function setActive(active: boolean) {
+      if (active === activeApplied.current) return;
+      activeApplied.current = active;
+      try {
+        if (active) {
+          const placedSide = await api.setWidgetActive(true, ACTIVE_WIDTH, false);
+          // A collapse may have superseded us during the decide round-trip; bail so
+          // we don't re-expand a window that should be idle.
+          if (activeApplied.current !== true) return;
+          flushSync(() => setSide(placedSide));
+          await api.setWidgetActive(true, ACTIVE_WIDTH, true);
+        } else {
+          flushSync(() => setSide("right"));
+          await api.setWidgetActive(false, ACTIVE_WIDTH, true);
+        }
+      } catch {
+        // Roll back so a later attempt can retry the transition.
+        activeApplied.current = !active;
+      }
+    }
+
+    function isOverIcon(event: DragEvent) {
+      const icon = iconRef.current;
+      if (!icon) return true;
+      const rect = icon.getBoundingClientRect();
+      return (
+        event.clientX >= rect.left &&
+        event.clientX <= rect.right &&
+        event.clientY >= rect.top &&
+        event.clientY <= rect.bottom
+      );
+    }
+
+    function clearDragLeaveTimer() {
+      if (dragLeaveTimer.current) {
+        clearTimeout(dragLeaveTimer.current);
+        dragLeaveTimer.current = null;
+      }
+    }
+
+    function scheduleDragLeaveTimeout() {
+      clearDragLeaveTimer();
+      dragLeaveTimer.current = setTimeout(() => {
+        dragLeaveTimer.current = null;
+        if (!locked.current) toIdle();
+      }, DRAG_LEAVE_GRACE_MS);
     }
 
     function toIdle() {
+      clearDragLeaveTimer();
       batch.current = null;
       hovering.current = false;
       locked.current = false;
@@ -202,6 +274,7 @@ export default function FloatingIcon() {
     // Show the "drop to send to X" hint, resolving the target name lazily.
     function showDragover() {
       if (locked.current) return;
+      clearDragLeaveTimer();
       if (!hovering.current) {
         hovering.current = true;
         setActive(true);
@@ -258,6 +331,30 @@ export default function FloatingIcon() {
       scheduleIdle(2800);
     }
 
+    // Start a batch for a drop, or fold it into one already in flight to the same
+    // peer. A second large drop can land while the first is still staging; merging
+    // (rather than overwriting batch.current) keeps both files' terminal rows
+    // counted so the pill reports the combined "Sent N files" instead of dropping
+    // the first batch and under-reporting.
+    function beginOrExtendBatch(peer: PeerDevice, count: number) {
+      const current = batch.current;
+      if (current && current.peerId === peer.id) {
+        current.total += count;
+      } else {
+        batch.current = {
+          peerId: peer.id,
+          name: peer.name,
+          total: count,
+          done: new Set(),
+          success: 0,
+          cancelled: 0,
+        };
+      }
+      locked.current = true;
+      setFeedback({ kind: "sending", name: peer.name });
+      setActive(true);
+    }
+
     // Read a dropped file in slices, stage the bytes in the backend, then hand it
     // to the chunked transport. Throws if staging or dispatch fails.
     async function stageAndSend(peerId: string, file: File) {
@@ -278,17 +375,7 @@ export default function FloatingIcon() {
     async function handleFileDrop(files: File[]) {
       const peer = await resolveTarget();
       if (!peer) return;
-      batch.current = {
-        peerId: peer.id,
-        name: peer.name,
-        total: files.length,
-        done: new Set(),
-        success: 0,
-        cancelled: 0,
-      };
-      locked.current = true;
-      setFeedback({ kind: "sending", name: peer.name });
-      setActive(true);
+      beginOrExtendBatch(peer, files.length);
       for (const file of files) {
         try {
           await stageAndSend(peer.id, file);
@@ -305,17 +392,7 @@ export default function FloatingIcon() {
     async function handlePathDrop(label: string, paths: string[]) {
       const peer = await resolveTarget();
       if (!peer) return;
-      batch.current = {
-        peerId: peer.id,
-        name: peer.name,
-        total: paths.length,
-        done: new Set(),
-        success: 0,
-        cancelled: 0,
-      };
-      locked.current = true;
-      setFeedback({ kind: "sending", name: peer.name });
-      setActive(true);
+      beginOrExtendBatch(peer, paths.length);
       try {
         await api.sendFiles([peer.id], paths);
       } catch {
@@ -375,9 +452,18 @@ export default function FloatingIcon() {
 
     function onTransfer(transfer: TransferProgress) {
       const current = batch.current;
-      if (!current || transfer.peerId !== current.peerId) return;
-      if (!TERMINAL.includes(transfer.state)) return;
-      recordDone(transfer.id, transfer.state as "complete" | "cancelled" | "failed");
+      if (current && transfer.peerId === current.peerId) {
+        if (TERMINAL.includes(transfer.state)) {
+          recordDone(transfer.id, transfer.state as "complete" | "cancelled" | "failed");
+        }
+        return;
+      }
+      // A transfer the widget didn't start (e.g. a send from the main window) that
+      // failed: surface it by the widget too, unless the widget is already busy
+      // showing its own send/result (don't clobber that).
+      if (transfer.state === "failed" && !locked.current && !batch.current) {
+        fail(transfer.error ? `${transfer.peerName}: ${transfer.error}` : `Couldn't send to ${transfer.peerName}`);
+      }
     }
 
     let unlistenTransfer: (() => void) | undefined;
@@ -392,15 +478,27 @@ export default function FloatingIcon() {
     // stops the webview from navigating to a dropped URL or opening a dropped file.
     const onDomDragOver = (event: DragEvent) => {
       event.preventDefault();
-      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
-      showDragover();
+      const overIcon = isOverIcon(event);
+      if (event.dataTransfer) event.dataTransfer.dropEffect = overIcon ? "copy" : "none";
+      if (overIcon) showDragover();
+      else if (!locked.current && hovering.current) toIdle();
     };
     const onDomDragLeave = (event: DragEvent) => {
       // Fires with no relatedTarget when the pointer leaves the window entirely.
-      if (!event.relatedTarget && !locked.current) toIdle();
+      // When the widget grows left, the native move/resize can produce the same
+      // signal even though the pointer is still over the icon. Give the next
+      // dragover a moment to arrive before treating it as a real leave.
+      if (!event.relatedTarget && !locked.current) {
+        scheduleDragLeaveTimeout();
+      }
     };
     const onDomDrop = (event: DragEvent) => {
       event.preventDefault();
+      clearDragLeaveTimer();
+      if (!locked.current && !isOverIcon(event)) {
+        toIdle();
+        return;
+      }
       const data = event.dataTransfer;
       const files = data?.files ? Array.from(data.files) : [];
       const text = extractDroppedText(data);
@@ -428,6 +526,7 @@ export default function FloatingIcon() {
     return () => {
       cancelled = true;
       if (resetTimer.current) clearTimeout(resetTimer.current);
+      clearDragLeaveTimer();
       if (unlistenTransfer) unlistenTransfer();
       window.removeEventListener("dragover", onDomDragOver);
       window.removeEventListener("dragleave", onDomDragLeave);
@@ -459,7 +558,7 @@ export default function FloatingIcon() {
   }
 
   return (
-    <div className={`fi-root${radar ? " radar" : ""}`}>
+    <div className={`fi-root${radar ? " radar" : ""}${side === "left" ? " pill-left" : ""}`}>
       {radar && (
         <div className="fi-radar" aria-hidden="true">
           <span />
@@ -468,6 +567,7 @@ export default function FloatingIcon() {
         </div>
       )}
       <button
+        ref={iconRef}
         className={`floating-icon${feedback.kind === "dragover" ? " drag-over" : ""}`}
         title="Open SimplePass — or drop files, links, or text to send"
         onMouseDown={onMouseDown}

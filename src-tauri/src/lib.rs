@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
-    fs,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -49,6 +49,13 @@ const MAX_LINE_BYTES: u64 = 1024 * 1024; // 1 MiB
 const MAX_AVATAR_LEN: usize = 256 * 1024; // 256 KiB
 /// Cap on persisted transfer history so `state.json` cannot grow without bound.
 const MAX_PERSISTED_TRANSFERS: usize = 200;
+/// Cap on persisted chat/file/link history. Each save rewrites `state.json`, so
+/// unbounded message history is both a disk-growth and latency risk.
+const MAX_PERSISTED_MESSAGES: usize = 2_000;
+/// Largest text chat message accepted from the UI or a paired peer.
+const MAX_MESSAGE_TEXT_LEN: usize = 16 * 1024; // 16 KiB
+/// Largest http(s) URL accepted for link sharing/opening.
+const MAX_LINK_URL_LEN: usize = 4 * 1024; // 4 KiB
 /// Per-call read/write timeout on a peer TCP connection. A silent or hung peer
 /// can therefore never park a sender or receiver thread indefinitely.
 const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -76,6 +83,14 @@ const AUTO_OPEN_MIN_INTERVAL_MS: i64 = 1200;
 /// Number of live inbound connection-handler threads. Bounded by
 /// `MAX_CONNECTION_THREADS` in `run_tcp_listener`.
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+struct ActiveConnectionGuard;
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// File extensions we are willing to auto-open with the OS default handler. This
 /// is an allowlist of inert, viewer-opened media/document types — never a
@@ -110,6 +125,9 @@ struct SetupState {
     /// viewer as they arrive (files with no associated handler are skipped).
     #[serde(default)]
     auto_open: bool,
+    /// UI color theme: "light" (Warm Paper, default) or "dark" (Warm Ember).
+    #[serde(default = "default_theme")]
+    theme: String,
     /// Last on-screen position of the floating icon, so it reappears where the
     /// user left it across launches.
     #[serde(default)]
@@ -130,9 +148,15 @@ struct SetupResponse {
     floating_icon: bool,
     #[serde(default)]
     auto_open: bool,
+    #[serde(default = "default_theme")]
+    theme: String,
     /// Our own X25519 public key (base64), so the UI can show a verification
     /// fingerprint the user can read out-of-band when approving a pairing.
     public_key: Option<String>,
+}
+
+fn default_theme() -> String {
+    "light".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,13 +217,19 @@ fn make_chat_message(peer_id: String, direction: &str, kind: &str, text: String)
     }
 }
 
-fn record_chat_message(app: &AppHandle, state: &State<AppState>, message: ChatMessage) -> AppResult<()> {
+fn record_chat_message(
+    app: &AppHandle,
+    state: &State<AppState>,
+    message: ChatMessage,
+) -> AppResult<()> {
     {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
         persisted.messages.push(message.clone());
+        trim_messages(&mut persisted);
         save_state(&state.path, &persisted)?;
     }
-    app.emit("chat-message", message).map_err(|err| err.to_string())
+    app.emit("chat-message", message)
+        .map_err(|err| err.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +266,7 @@ impl Default for PersistedState {
                 avatar: None,
                 floating_icon: false,
                 auto_open: false,
+                theme: default_theme(),
                 widget_x: None,
                 widget_y: None,
             },
@@ -265,23 +296,60 @@ struct DiscoveryPacket {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum WireMessage {
-    PairRequest { device: DiscoveryPacket },
-    PairAccepted { device: DiscoveryPacket },
-    Chat { peer_id: String, text: String },
-    Link { peer_id: String, url: String },
-    FileStart { peer_id: String, transfer_id: String, file_name: String, total_size: u64 },
-    FileChunk { peer_id: String, transfer_id: String, data: String },
-    FileEnd { peer_id: String, transfer_id: String },
-    FileCancel { peer_id: String, transfer_id: String },
-    Typing { peer_id: String, is_typing: bool },
-    Profile { peer_id: String, avatar: Option<String> },
+    PairRequest {
+        device: DiscoveryPacket,
+    },
+    PairAccepted {
+        device: DiscoveryPacket,
+    },
+    Chat {
+        peer_id: String,
+        text: String,
+    },
+    Link {
+        peer_id: String,
+        url: String,
+    },
+    FileStart {
+        peer_id: String,
+        transfer_id: String,
+        file_name: String,
+        total_size: u64,
+    },
+    FileChunk {
+        peer_id: String,
+        transfer_id: String,
+        data: String,
+    },
+    FileEnd {
+        peer_id: String,
+        transfer_id: String,
+    },
+    FileCancel {
+        peer_id: String,
+        transfer_id: String,
+    },
+    Typing {
+        peer_id: String,
+        is_typing: bool,
+    },
+    Profile {
+        peer_id: String,
+        avatar: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum TransportEnvelope {
-    Plain { message: WireMessage },
-    Encrypted { peer_id: String, nonce: String, body: String },
+    Plain {
+        message: WireMessage,
+    },
+    Encrypted {
+        peer_id: String,
+        nonce: String,
+        body: String,
+    },
 }
 
 struct AppState {
@@ -297,6 +365,16 @@ struct AppState {
     /// Timestamp (ms) of the last auto-open, used to rate-limit auto-opening of
     /// received files/links. See `auto_open_rate_ok`.
     last_auto_open: Mutex<i64>,
+    /// Resting top-left (physical px) of the widget, captured when it expands to
+    /// show the status pill so `set_widget_active(false)` can restore it. When the
+    /// widget grows leftward (no room on the right of its monitor) the window is
+    /// moved, and this is the only record of where the resting icon belonged.
+    widget_anchor: Mutex<Option<PhysicalPosition<i32>>>,
+    /// True while the widget is expanded to show the status pill. Programmatic
+    /// resizes/moves during expansion fire `onMoved` in the webview; this flag tells
+    /// `save_widget_position` to ignore those so the persisted position stays the
+    /// resting anchor rather than a transient expanded offset.
+    widget_active: AtomicBool,
 }
 
 /// One open TCP connection to a target peer for an in-flight outgoing file.
@@ -310,6 +388,7 @@ struct PeerConn {
 
 #[derive(Debug)]
 struct IncomingFile {
+    peer_id: String,
     path: PathBuf,
     /// Append handle kept open for the whole transfer so each chunk is a single
     /// write instead of reopening the file 64 KiB at a time.
@@ -347,6 +426,7 @@ fn save_setup(
         avatar: existing.avatar.clone(),
         floating_icon: existing.floating_icon,
         auto_open: existing.auto_open,
+        theme: existing.theme.clone(),
         widget_x: existing.widget_x,
         widget_y: existing.widget_y,
     };
@@ -390,7 +470,11 @@ fn recent_peer(state: State<AppState>) -> AppResult<Option<PeerDevice>> {
             .max()
     };
     // Newest chat first; peers with no messages (None) sort last, broken by last_seen.
-    paired.sort_by(|a, b| last_msg(b).cmp(&last_msg(a)).then(b.last_seen.cmp(&a.last_seen)));
+    paired.sort_by(|a, b| {
+        last_msg(b)
+            .cmp(&last_msg(a))
+            .then(b.last_seen.cmp(&a.last_seen))
+    });
     Ok(paired.into_iter().next())
 }
 
@@ -426,15 +510,38 @@ fn pair_peer(app: AppHandle, state: State<AppState>, peer_id: String) -> AppResu
         let _ = app.emit("peers-changed", reverted);
         return Err(err);
     }
-    app.emit("peers-changed", peers).map_err(|err| err.to_string())
+    app.emit("peers-changed", peers)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-fn accept_pairing(app: AppHandle, state: State<AppState>, peer_id: String) -> AppResult<()> {
+fn accept_pairing(
+    app: AppHandle,
+    state: State<AppState>,
+    peer_id: String,
+    public_key: String,
+) -> AppResult<()> {
     let shared_secret = {
         let persisted = state.inner.lock().map_err(lock_err)?;
-        let peer_public_key = peer_public_key(&persisted.peers, &peer_id)?;
-        derive_shared_secret(&persisted.setup.identity_secret, &peer_public_key)?
+        let peer = persisted
+            .peers
+            .iter()
+            .find(|peer| peer.id == peer_id)
+            .ok_or_else(|| "Peer not found.".to_string())?;
+        if peer.trust_state != "pending" {
+            return Err("This pairing request is no longer pending.".to_string());
+        }
+        let peer_public_key = peer
+            .public_key
+            .as_deref()
+            .ok_or_else(|| "Peer public key is missing.".to_string())?;
+        if peer_public_key != public_key {
+            return Err(
+                "The peer key changed before approval. Deny this request and pair again."
+                    .to_string(),
+            );
+        }
+        derive_shared_secret(&persisted.setup.identity_secret, peer_public_key)?
     };
     let (peers, peer) = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
@@ -454,18 +561,28 @@ fn accept_pairing(app: AppHandle, state: State<AppState>, peer_id: String) -> Ap
     let packet = local_discovery_packet(&state)?;
     let _ = send_plain_wire(&peer, WireMessage::PairAccepted { device: packet });
     send_profile_to_peer(&state, &peer_id);
-    app.emit("peers-changed", peers).map_err(|err| err.to_string())
+    app.emit("peers-changed", peers)
+        .map_err(|err| err.to_string())
 }
 
 /// Pushes our current profile (avatar) to a single paired peer. Best-effort.
 fn send_profile_to_peer(state: &State<AppState>, peer_id: &str) {
     let (local_id, avatar) = match state.inner.lock() {
-        Ok(persisted) => (persisted.setup.device_id.clone(), persisted.setup.avatar.clone()),
+        Ok(persisted) => (
+            persisted.setup.device_id.clone(),
+            persisted.setup.avatar.clone(),
+        ),
         Err(_) => return,
     };
     if let Ok(peer) = get_peer(state, peer_id) {
         if peer.trust_state == "paired" {
-            let _ = send_wire(&peer, WireMessage::Profile { peer_id: local_id, avatar });
+            let _ = send_wire(
+                &peer,
+                WireMessage::Profile {
+                    peer_id: local_id,
+                    avatar,
+                },
+            );
         }
     }
 }
@@ -481,7 +598,8 @@ fn deny_pairing(app: AppHandle, state: State<AppState>, peer_id: String) -> AppR
         save_state(&state.path, &persisted)?;
         peers
     };
-    app.emit("peers-changed", peers).map_err(|err| err.to_string())
+    app.emit("peers-changed", peers)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -496,7 +614,8 @@ fn revoke_peer(app: AppHandle, state: State<AppState>, peer_id: String) -> AppRe
         save_state(&state.path, &persisted)?;
         peers
     };
-    app.emit("peers-changed", peers).map_err(|err| err.to_string())
+    app.emit("peers-changed", peers)
+        .map_err(|err| err.to_string())
 }
 
 /// Completely forget a device: remove its record plus all chat history and
@@ -508,13 +627,18 @@ fn delete_peer(app: AppHandle, state: State<AppState>, peer_id: String) -> AppRe
     let peers = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
         persisted.peers.retain(|peer| peer.id != peer_id);
-        persisted.messages.retain(|message| message.peer_id != peer_id);
-        persisted.transfers.retain(|transfer| transfer.peer_id != peer_id);
+        persisted
+            .messages
+            .retain(|message| message.peer_id != peer_id);
+        persisted
+            .transfers
+            .retain(|transfer| transfer.peer_id != peer_id);
         let peers = persisted.peers.clone();
         save_state(&state.path, &persisted)?;
         peers
     };
-    app.emit("peers-changed", peers).map_err(|err| err.to_string())
+    app.emit("peers-changed", peers)
+        .map_err(|err| err.to_string())
 }
 
 /// Manually probe the LAN: broadcast a discovery packet with `request = true` so
@@ -529,12 +653,16 @@ fn rescan_peers(app: AppHandle, state: State<AppState>) -> AppResult<()> {
     let socket = UdpSocket::bind(("0.0.0.0", 0)).map_err(|err| err.to_string())?;
     socket.set_broadcast(true).map_err(|err| err.to_string())?;
     socket
-        .send_to(&body, SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT)))
+        .send_to(
+            &body,
+            SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT)),
+        )
         .map_err(|err| err.to_string())?;
 
     let _ = mark_stale_peers_offline(&app, &state, now_ms());
     let peers = { state.inner.lock().map_err(lock_err)?.peers.clone() };
-    app.emit("peers-changed", peers).map_err(|err| err.to_string())
+    app.emit("peers-changed", peers)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -549,18 +677,36 @@ fn list_messages(state: State<AppState>, peer_id: String) -> AppResult<Vec<ChatM
 }
 
 #[tauri::command]
-fn send_message(app: AppHandle, state: State<AppState>, peer_id: String, text: String) -> AppResult<()> {
+fn send_message(
+    app: AppHandle,
+    state: State<AppState>,
+    peer_id: String,
+    text: String,
+) -> AppResult<()> {
+    validate_message_text(&text)?;
     ensure_paired(&state, &peer_id)?;
     let peer = get_peer(&state, &peer_id)?;
     let local_id = existing_device_id(&state)?;
-    send_wire(&peer, WireMessage::Chat { peer_id: local_id, text: text.clone() })?;
+    send_wire(
+        &peer,
+        WireMessage::Chat {
+            peer_id: local_id,
+            text: text.clone(),
+        },
+    )?;
     let message = make_chat_message(peer_id, "sent", "text", text);
     record_chat_message(&app, &state, message)
 }
 
 // Records a chat message received from a paired peer. Internal only (called from
 // `handle_message`), not a Tauri command.
-fn receive_message(app: &AppHandle, state: &State<AppState>, peer_id: String, text: String) -> AppResult<()> {
+fn receive_message(
+    app: &AppHandle,
+    state: &State<AppState>,
+    peer_id: String,
+    text: String,
+) -> AppResult<()> {
+    validate_message_text(&text)?;
     ensure_paired(state, &peer_id)?;
     let message = make_chat_message(peer_id, "received", "text", text);
     // The toast (and its click-to-open behavior) is raised on the frontend from
@@ -574,9 +720,14 @@ fn receive_message(app: &AppHandle, state: &State<AppState>, peer_id: String, te
 // (the user opens it by clicking its bubble via `open_link`); only when the user
 // has explicitly enabled the auto-open toggle do we hand the validated http(s)
 // URL to the OS opener as it arrives.
-fn receive_link(app: &AppHandle, state: &State<AppState>, peer_id: String, url: String) -> AppResult<()> {
+fn receive_link(
+    app: &AppHandle,
+    state: &State<AppState>,
+    peer_id: String,
+    url: String,
+) -> AppResult<()> {
     ensure_paired(state, &peer_id)?;
-    if !is_http_url(&url) {
+    if validate_link_url(&url).is_err() {
         return Ok(());
     }
     let auto = auto_open_enabled(state)?;
@@ -601,9 +752,7 @@ fn send_link(
     if peer_ids.is_empty() {
         return Ok(Vec::new());
     }
-    if !is_http_url(&url) {
-        return Err("Only http(s) links can be shared.".to_string());
-    }
+    validate_link_url(&url)?;
 
     let local_id = existing_device_id(&state)?;
     let mut transfers = make_transfers(&state, &peer_ids, &url, "link")?;
@@ -615,12 +764,19 @@ fn send_link(
         transfer.state = "sending".to_string();
         emit_transfer(&app, transfer.clone())?;
         let peer = get_peer(&state, &transfer.peer_id)?;
-        match send_wire(&peer, WireMessage::Link { peer_id: local_id.clone(), url: url.clone() }) {
+        match send_wire(
+            &peer,
+            WireMessage::Link {
+                peer_id: local_id.clone(),
+                url: url.clone(),
+            },
+        ) {
             Ok(()) => {
                 transfer.progress = 100;
                 transfer.state = "complete".to_string();
                 transfer.error = None;
-                let mut message = make_chat_message(transfer.peer_id.clone(), "sent", "link", url.clone());
+                let mut message =
+                    make_chat_message(transfer.peer_id.clone(), "sent", "link", url.clone());
                 message.url = Some(url.clone());
                 let _ = record_chat_message(&app, &state, message);
             }
@@ -674,7 +830,10 @@ fn send_files(
             return Err(format!("{} is not paired.", peer.name));
         }
         if peer.host.trim().is_empty() {
-            return Err(format!("{} does not have a network address yet.", peer.name));
+            return Err(format!(
+                "{} does not have a network address yet.",
+                peer.name
+            ));
         }
         let secret = peer
             .shared_secret
@@ -725,7 +884,14 @@ fn send_one_file(
             for (peer, _) in targets {
                 let _ = emit_transfer(
                     app,
-                    file_row(&transfer_id, peer, &file_name, 0, "failed", Some(err.to_string())),
+                    file_row(
+                        &transfer_id,
+                        peer,
+                        &file_name,
+                        0,
+                        "failed",
+                        Some(err.to_string()),
+                    ),
                 );
             }
             return;
@@ -778,7 +944,14 @@ fn send_one_file(
             Err(err) => {
                 let _ = emit_transfer(
                     app,
-                    file_row(&transfer_id, peer, &file_name, 0, "failed", Some(err.to_string())),
+                    file_row(
+                        &transfer_id,
+                        peer,
+                        &file_name,
+                        0,
+                        "failed",
+                        Some(err.to_string()),
+                    ),
                 );
             }
         }
@@ -825,14 +998,30 @@ fn send_one_file(
                 conn.failed = true;
                 let _ = emit_transfer(
                     app,
-                    peer_row(&transfer_id, &conn.peer_id, &conn.peer_name, &file_name, progress, "failed", Some(err)),
+                    peer_row(
+                        &transfer_id,
+                        &conn.peer_id,
+                        &conn.peer_name,
+                        &file_name,
+                        progress,
+                        "failed",
+                        Some(err),
+                    ),
                 );
             }
         }
         for conn in conns.iter().filter(|conn| !conn.failed) {
             let _ = emit_transfer(
                 app,
-                peer_row(&transfer_id, &conn.peer_id, &conn.peer_name, &file_name, progress, "sending", None),
+                peer_row(
+                    &transfer_id,
+                    &conn.peer_id,
+                    &conn.peer_name,
+                    &file_name,
+                    progress,
+                    "sending",
+                    None,
+                ),
             );
         }
     }
@@ -882,7 +1071,15 @@ fn send_one_file(
         } else {
             ("complete", None)
         };
-        let row = peer_row(&transfer_id, &conn.peer_id, &conn.peer_name, &file_name, 100, terminal, error);
+        let row = peer_row(
+            &transfer_id,
+            &conn.peer_id,
+            &conn.peer_name,
+            &file_name,
+            100,
+            terminal,
+            error,
+        );
         if let Ok(mut persisted) = state.inner.lock() {
             persisted.transfers.push(row.clone());
             trim_transfers(&mut persisted);
@@ -891,7 +1088,8 @@ fn send_one_file(
         let _ = emit_transfer(app, row);
 
         if !cancelled && !read_failed && !conn.failed {
-            let mut message = make_chat_message(conn.peer_id.clone(), "sent", "file", file_name.clone());
+            let mut message =
+                make_chat_message(conn.peer_id.clone(), "sent", "file", file_name.clone());
             message.file_name = Some(file_name.clone());
             message.file_size = Some(total);
             message.file_path = record_path.map(|p| p.to_string());
@@ -908,7 +1106,15 @@ fn file_row(
     state_str: &str,
     error: Option<String>,
 ) -> TransferProgress {
-    peer_row(transfer_id, &peer.id, &peer.name, file_name, progress, state_str, error)
+    peer_row(
+        transfer_id,
+        &peer.id,
+        &peer.name,
+        file_name,
+        progress,
+        state_str,
+        error,
+    )
 }
 
 fn peer_row(
@@ -947,7 +1153,9 @@ fn cancel_file_send(state: State<AppState>, transfer_id: String) -> AppResult<()
 /// escape the temp dir or collide with an unrelated file.
 fn staged_file_path(session_id: &str) -> AppResult<PathBuf> {
     if session_id.is_empty()
-        || !session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
     {
         return Err("Invalid staging id.".to_string());
     }
@@ -962,7 +1170,9 @@ fn staged_file_path(session_id: &str) -> AppResult<PathBuf> {
 #[tauri::command]
 fn stage_file_chunk(session_id: String, data: String) -> AppResult<()> {
     let path = staged_file_path(&session_id)?;
-    let bytes = BASE64.decode(data.as_bytes()).map_err(|err| err.to_string())?;
+    let bytes = BASE64
+        .decode(data.as_bytes())
+        .map_err(|err| err.to_string())?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1029,7 +1239,10 @@ fn send_staged_file(
             return Err(format!("{} is not paired.", peer.name));
         }
         if peer.host.trim().is_empty() {
-            return Err(format!("{} does not have a network address yet.", peer.name));
+            return Err(format!(
+                "{} does not have a network address yet.",
+                peer.name
+            ));
         }
         let secret = peer
             .shared_secret
@@ -1054,7 +1267,14 @@ fn send_staged_file(
         let record_path = persisted
             .as_ref()
             .map(|dest| dest.to_string_lossy().to_string());
-        send_one_file(&app, &local_id, &targets, &send_path, Some(&name), record_path.as_deref());
+        send_one_file(
+            &app,
+            &local_id,
+            &targets,
+            &send_path,
+            Some(&name),
+            record_path.as_deref(),
+        );
         let _ = fs::remove_file(&staged);
     });
     Ok(())
@@ -1086,7 +1306,13 @@ fn send_typing(state: State<AppState>, peer_id: String, is_typing: bool) -> AppR
     let local_id = existing_device_id(&state)?;
     if let Ok(peer) = get_peer(&state, &peer_id) {
         if peer.trust_state == "paired" {
-            let _ = send_wire(&peer, WireMessage::Typing { peer_id: local_id, is_typing });
+            let _ = send_wire(
+                &peer,
+                WireMessage::Typing {
+                    peer_id: local_id,
+                    is_typing,
+                },
+            );
         }
     }
     Ok(())
@@ -1163,10 +1389,14 @@ fn open_path(path: String) -> AppResult<()> {
 }
 
 #[tauri::command]
-fn set_avatar(app: AppHandle, state: State<AppState>, avatar: Option<String>) -> AppResult<SetupResponse> {
+fn set_avatar(
+    app: AppHandle,
+    state: State<AppState>,
+    avatar: Option<String>,
+) -> AppResult<SetupResponse> {
     if let Some(value) = &avatar {
-        if value.len() > MAX_AVATAR_LEN {
-            return Err("That image is too large.".to_string());
+        if !is_valid_avatar(value) {
+            return Err("Choose a PNG, JPEG, WebP, or GIF image under 256 KB.".to_string());
         }
     }
     let (response, paired) = {
@@ -1197,7 +1427,18 @@ fn set_avatar(app: AppHandle, state: State<AppState>, avatar: Option<String>) ->
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    // Must be the FIRST plugin registered so it intercepts a duplicate launch before
+    // any window is created. When the updater relaunches us on Windows the old instance
+    // can still be tearing down; without this the two processes race for the ports and
+    // WebView2 user-data dir, leaving the new window stuck on "Starting SimplePass…".
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            reveal_main_window(app);
+        }));
+    }
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
@@ -1207,7 +1448,8 @@ pub fn run() {
         ))
         .setup(|app| {
             #[cfg(desktop)]
-            app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
             let path = app_data_file(app.handle())?;
             let persisted = load_state(&path);
             let _ = configure_autostart(app.handle(), persisted.setup.start_at_login);
@@ -1224,6 +1466,8 @@ pub fn run() {
                 incoming_files: Mutex::new(HashMap::new()),
                 cancels: Mutex::new(HashMap::new()),
                 last_auto_open: Mutex::new(0),
+                widget_anchor: Mutex::new(None),
+                widget_active: AtomicBool::new(false),
             });
             build_tray(app.handle())?;
             if widget.0 {
@@ -1275,7 +1519,9 @@ pub fn run() {
             show_window,
             set_floating_icon,
             set_auto_open,
+            set_theme,
             collapse_widget,
+            set_widget_active,
             save_widget_position
         ])
         .run(tauri::generate_context!())
@@ -1289,8 +1535,28 @@ fn start_transport(app: AppHandle) {
     thread::spawn(move || run_discovery(discovery_app));
 }
 
+/// Retry a socket bind for a few seconds before giving up. A too-fast restart can
+/// leave the previous instance briefly holding the port; a single bind attempt
+/// would then fail and kill the transport for the whole session (only a banner, no
+/// recovery until the next launch). Retrying rides out the stale bind. ~5s budget.
+fn bind_with_retry<T>(mut bind: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut attempt = 0;
+    loop {
+        match bind() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                attempt += 1;
+                if attempt >= 10 {
+                    return Err(err);
+                }
+                thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+}
+
 fn run_tcp_listener(app: AppHandle) {
-    let listener = match TcpListener::bind(("0.0.0.0", TRANSPORT_PORT)) {
+    let listener = match bind_with_retry(|| TcpListener::bind(("0.0.0.0", TRANSPORT_PORT))) {
         Ok(listener) => listener,
         Err(err) => {
             let _ = app.emit(
@@ -1303,14 +1569,18 @@ fn run_tcp_listener(app: AppHandle) {
     for stream in listener.incoming().flatten() {
         // Bound concurrent handler threads so a connection flood can't spawn
         // unbounded threads. Over the cap, drop the socket (closes on drop).
-        if ACTIVE_CONNECTIONS.load(Ordering::Relaxed) >= MAX_CONNECTION_THREADS {
+        if ACTIVE_CONNECTIONS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+                (active < MAX_CONNECTION_THREADS).then_some(active + 1)
+            })
+            .is_err()
+        {
             continue;
         }
-        ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         let app = app.clone();
         thread::spawn(move || {
+            let _active = ActiveConnectionGuard;
             let _ = handle_stream(app, stream);
-            ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
@@ -1343,7 +1613,8 @@ fn handle_stream(app: AppHandle, stream: TcpStream) -> AppResult<()> {
             continue;
         }
         let state = app.state::<AppState>();
-        let envelope: TransportEnvelope = serde_json::from_str(trimmed).map_err(|err| err.to_string())?;
+        let envelope: TransportEnvelope =
+            serde_json::from_str(trimmed).map_err(|err| err.to_string())?;
         let message = decrypt_envelope(&state, envelope)?;
         handle_message(&app, &state, message, remote_addr)?;
     }
@@ -1359,7 +1630,10 @@ fn handle_message(
     match message {
         WireMessage::PairRequest { device } => {
             let peer = upsert_discovered_peer(app, state, device, "pending", remote_addr, None)?;
-            app.emit("pairing-request", peer).map_err(|err| err.to_string())?;
+            if peer.trust_state != "paired" {
+                app.emit("pairing-request", peer)
+                    .map_err(|err| err.to_string())?;
+            }
         }
         WireMessage::PairAccepted { device } => {
             let device_id = device.device_id.clone();
@@ -1369,16 +1643,24 @@ fn handle_message(
             // as a trusted peer with no user approval.
             let shared_secret = {
                 let persisted = state.inner.lock().map_err(lock_err)?;
-                let pending = persisted
-                    .peers
-                    .iter()
-                    .any(|peer| peer.id == device_id && peer.trust_state == "pending");
-                if !pending {
+                let Some(peer) = persisted.peers.iter().find(|peer| peer.id == device_id) else {
+                    return Ok(());
+                };
+                if peer.trust_state != "pending"
+                    || peer.public_key.as_deref() != Some(device.public_key.as_str())
+                {
                     return Ok(());
                 }
                 derive_shared_secret(&persisted.setup.identity_secret, &device.public_key)?
             };
-            upsert_discovered_peer(app, state, device, "paired", remote_addr, Some(shared_secret))?;
+            upsert_discovered_peer(
+                app,
+                state,
+                device,
+                "paired",
+                remote_addr,
+                Some(shared_secret),
+            )?;
             send_profile_to_peer(state, &device_id);
         }
         WireMessage::Chat { peer_id, text } => {
@@ -1395,8 +1677,13 @@ fn handle_message(
             .map_err(|err| err.to_string())?;
         }
         WireMessage::Profile { peer_id, avatar } => {
-            // Drop oversized avatars rather than persisting a peer-controlled blob.
-            let avatar = avatar.filter(|value| value.len() <= MAX_AVATAR_LEN);
+            // Drop invalid avatars rather than persisting or rendering a
+            // peer-controlled URL/scheme.
+            let avatar = match avatar {
+                Some(value) if is_valid_avatar(&value) => Some(value),
+                None => None,
+                Some(_) => return Ok(()),
+            };
             let peers = {
                 let mut persisted = state.inner.lock().map_err(lock_err)?;
                 if let Some(peer) = persisted.peers.iter_mut().find(|peer| peer.id == peer_id) {
@@ -1406,7 +1693,8 @@ fn handle_message(
                 save_state(&state.path, &persisted)?;
                 peers
             };
-            app.emit("peers-changed", peers).map_err(|err| err.to_string())?;
+            app.emit("peers-changed", peers)
+                .map_err(|err| err.to_string())?;
         }
         WireMessage::FileStart {
             peer_id,
@@ -1423,10 +1711,16 @@ fn handle_message(
         } => {
             receive_file_chunk(app, state, peer_id, transfer_id, data)?;
         }
-        WireMessage::FileEnd { peer_id, transfer_id } => {
+        WireMessage::FileEnd {
+            peer_id,
+            transfer_id,
+        } => {
             receive_file_end(app, state, peer_id, transfer_id)?;
         }
-        WireMessage::FileCancel { peer_id, transfer_id } => {
+        WireMessage::FileCancel {
+            peer_id,
+            transfer_id,
+        } => {
             receive_file_cancel(app, state, peer_id, transfer_id)?;
         }
     }
@@ -1434,7 +1728,7 @@ fn handle_message(
 }
 
 fn run_discovery(app: AppHandle) {
-    let socket = match UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) {
+    let socket = match bind_with_retry(|| UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT))) {
         Ok(socket) => socket,
         Err(err) => {
             let _ = app.emit(
@@ -1453,9 +1747,15 @@ fn run_discovery(app: AppHandle) {
     loop {
         let now = now_ms();
         if now - last_broadcast > 2500 {
-            if let Some(packet) = app.try_state::<AppState>().and_then(|state| local_discovery_packet(&state).ok()) {
+            if let Some(packet) = app
+                .try_state::<AppState>()
+                .and_then(|state| local_discovery_packet(&state).ok())
+            {
                 if let Ok(body) = serde_json::to_vec(&packet) {
-                    let _ = socket.send_to(&body, SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT)));
+                    let _ = socket.send_to(
+                        &body,
+                        SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT)),
+                    );
                 }
             }
             last_broadcast = now;
@@ -1472,13 +1772,22 @@ fn run_discovery(app: AppHandle) {
             Ok((size, addr)) => {
                 if let Ok(mut packet) = serde_json::from_slice::<DiscoveryPacket>(&buffer[..size]) {
                     if packet.magic == DISCOVERY_MAGIC {
-                        packet.port = if packet.port == 0 { TRANSPORT_PORT } else { packet.port };
+                        packet.port = if packet.port == 0 {
+                            TRANSPORT_PORT
+                        } else {
+                            packet.port
+                        };
                         let is_request = packet.request;
                         if let Some(state) = app.try_state::<AppState>() {
                             if let Ok(local_id) = existing_device_id(&state) {
                                 if packet.device_id != local_id {
                                     let mut packet_with_host = packet;
-                                    let _ = upsert_peer_from_addr(&app, &state, &mut packet_with_host, addr);
+                                    let _ = upsert_peer_from_addr(
+                                        &app,
+                                        &state,
+                                        &mut packet_with_host,
+                                        addr,
+                                    );
                                     // Answer a rescan probe by immediately announcing
                                     // ourselves so the requester sees us right away.
                                     if is_request {
@@ -1508,14 +1817,26 @@ fn upsert_peer_from_addr(
     let host = addr.ip().to_string();
     // Discovery packets are untrusted; bound the name before it is persisted.
     packet.device_name = clamp_device_name(&packet.device_name);
+    if public_key_array(&packet.public_key).is_err() {
+        return Ok(());
+    }
     let peers = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
-        match persisted.peers.iter_mut().find(|peer| peer.id == packet.device_id) {
+        match persisted
+            .peers
+            .iter_mut()
+            .find(|peer| peer.id == packet.device_id)
+        {
             Some(peer) => {
+                if !can_replace_peer_public_key(peer, &packet.public_key) {
+                    return Ok(());
+                }
                 peer.name = packet.device_name.clone();
                 peer.host = host.clone();
                 peer.port = packet.port;
-                peer.public_key = Some(packet.public_key.clone());
+                if peer.public_key.as_deref() != Some(packet.public_key.as_str()) {
+                    peer.public_key = Some(packet.public_key.clone());
+                }
                 peer.os = packet.os.clone();
                 peer.status = "online".to_string();
                 peer.last_seen = now_ms();
@@ -1540,7 +1861,8 @@ fn upsert_peer_from_addr(
         save_state(&state.path, &persisted)?;
         peers
     };
-    app.emit("peers-changed", peers).map_err(|err| err.to_string())
+    app.emit("peers-changed", peers)
+        .map_err(|err| err.to_string())
 }
 
 fn mark_stale_peers_offline(app: &AppHandle, state: &State<AppState>, now: i64) -> AppResult<()> {
@@ -1557,7 +1879,8 @@ fn mark_stale_peers_offline(app: &AppHandle, state: &State<AppState>, now: i64) 
     };
 
     if let Some(peers) = maybe_peers {
-        app.emit("peers-changed", peers).map_err(|err| err.to_string())?;
+        app.emit("peers-changed", peers)
+            .map_err(|err| err.to_string())?;
     }
     Ok(())
 }
@@ -1572,6 +1895,15 @@ fn clamp_device_name(name: &str) -> String {
         return "Unknown device".to_string();
     }
     trimmed.chars().take(MAX_DEVICE_NAME_LEN).collect()
+}
+
+fn can_replace_peer_public_key(peer: &PeerDevice, incoming_public_key: &str) -> bool {
+    match peer.public_key.as_deref() {
+        Some(existing) if existing != incoming_public_key => {
+            peer.trust_state == "unpaired" && peer.shared_secret.is_none()
+        }
+        _ => true,
+    }
 }
 
 /// Bound the stored peer list to `MAX_PEERS`. A LAN spoofer broadcasting many
@@ -1638,22 +1970,40 @@ fn upsert_discovered_peer(
     remote_addr: Option<SocketAddr>,
     shared_secret: Option<String>,
 ) -> AppResult<PeerDevice> {
-    let host = remote_addr.map(|addr| addr.ip().to_string()).unwrap_or_default();
+    let host = remote_addr
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_default();
     // Untrusted packet; bound the name before it is persisted.
     packet.device_name = clamp_device_name(&packet.device_name);
+    public_key_array(&packet.public_key)?;
     let (peers, changed_peer) = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
-        let changed_peer = match persisted.peers.iter_mut().find(|peer| peer.id == packet.device_id) {
+        let changed_peer = match persisted
+            .peers
+            .iter_mut()
+            .find(|peer| peer.id == packet.device_id)
+        {
             Some(peer) => {
+                if !can_replace_peer_public_key(peer, &packet.public_key) {
+                    return Err(
+                        "The peer key changed. Delete the device and pair again if this was expected."
+                            .to_string(),
+                    );
+                }
+                let keep_paired = peer.trust_state == "paired" && trust_state == "pending";
                 peer.name = packet.device_name.clone();
                 if !host.is_empty() {
                     peer.host = host.clone();
                 }
                 peer.port = packet.port;
-                peer.public_key = Some(packet.public_key.clone());
+                if peer.public_key.as_deref() != Some(packet.public_key.as_str()) {
+                    peer.public_key = Some(packet.public_key.clone());
+                }
                 peer.os = packet.os.clone();
                 peer.status = "online".to_string();
-                peer.trust_state = trust_state.to_string();
+                if !keep_paired {
+                    peer.trust_state = trust_state.to_string();
+                }
                 if shared_secret.is_some() {
                     peer.shared_secret = shared_secret.clone();
                 }
@@ -1675,7 +2025,11 @@ fn upsert_discovered_peer(
                     last_seen: now_ms(),
                 };
                 persisted.peers.push(peer);
-                persisted.peers.last().cloned().ok_or_else(|| "Peer not found.".to_string())?
+                persisted
+                    .peers
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| "Peer not found.".to_string())?
             }
         };
         enforce_peer_cap(&mut persisted);
@@ -1683,7 +2037,8 @@ fn upsert_discovered_peer(
         save_state(&state.path, &persisted)?;
         (peers, changed_peer)
     };
-    app.emit("peers-changed", peers).map_err(|err| err.to_string())?;
+    app.emit("peers-changed", peers)
+        .map_err(|err| err.to_string())?;
     Ok(changed_peer)
 }
 
@@ -1704,17 +2059,26 @@ fn dial_peer(host: &str, port: u16) -> std::io::Result<TcpStream> {
 
 fn send_plain_wire(peer: &PeerDevice, message: WireMessage) -> AppResult<()> {
     if peer.host.trim().is_empty() {
-        return Err(format!("{} does not have a network address yet.", peer.name));
+        return Err(format!(
+            "{} does not have a network address yet.",
+            peer.name
+        ));
     }
     let mut stream = dial_peer(peer.host.as_str(), peer.port).map_err(|err| err.to_string())?;
-    let body = serde_json::to_string(&TransportEnvelope::Plain { message }).map_err(|err| err.to_string())?;
-    stream.write_all(body.as_bytes()).map_err(|err| err.to_string())?;
+    let body = serde_json::to_string(&TransportEnvelope::Plain { message })
+        .map_err(|err| err.to_string())?;
+    stream
+        .write_all(body.as_bytes())
+        .map_err(|err| err.to_string())?;
     stream.write_all(b"\n").map_err(|err| err.to_string())
 }
 
 fn send_wire(peer: &PeerDevice, message: WireMessage) -> AppResult<()> {
     if peer.host.trim().is_empty() {
-        return Err(format!("{} does not have a network address yet.", peer.name));
+        return Err(format!(
+            "{} does not have a network address yet.",
+            peer.name
+        ));
     }
     let secret = peer
         .shared_secret
@@ -1734,11 +2098,17 @@ fn write_encrypted_line(
 ) -> AppResult<()> {
     let envelope = encrypt_message(peer_id, secret, message)?;
     let body = serde_json::to_string(&envelope).map_err(|err| err.to_string())?;
-    stream.write_all(body.as_bytes()).map_err(|err| err.to_string())?;
+    stream
+        .write_all(body.as_bytes())
+        .map_err(|err| err.to_string())?;
     stream.write_all(b"\n").map_err(|err| err.to_string())
 }
 
-fn encrypt_message(peer_id: &str, secret: &str, message: &WireMessage) -> AppResult<TransportEnvelope> {
+fn encrypt_message(
+    peer_id: &str,
+    secret: &str,
+    message: &WireMessage,
+) -> AppResult<TransportEnvelope> {
     let key = decode_secret(secret)?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|err| err.to_string())?;
     let mut nonce_bytes = [0_u8; 12];
@@ -1779,6 +2149,7 @@ fn setup_response(setup: &SetupState) -> SetupResponse {
         avatar: setup.avatar.clone(),
         floating_icon: setup.floating_icon,
         auto_open: setup.auto_open,
+        theme: setup.theme.clone(),
         public_key: derive_public_key(&setup.identity_secret).ok(),
     }
 }
@@ -1792,7 +2163,10 @@ fn plain_envelope_allowed(message: &WireMessage) -> bool {
     )
 }
 
-fn decrypt_envelope(state: &State<AppState>, envelope: TransportEnvelope) -> AppResult<WireMessage> {
+fn decrypt_envelope(
+    state: &State<AppState>,
+    envelope: TransportEnvelope,
+) -> AppResult<WireMessage> {
     match envelope {
         // Pairing is the only handshake that legitimately travels in the clear
         // (no shared secret exists yet). Every other message — chat, links,
@@ -1802,23 +2176,33 @@ fn decrypt_envelope(state: &State<AppState>, envelope: TransportEnvelope) -> App
             if plain_envelope_allowed(&message) {
                 Ok(message)
             } else {
-                Err("Rejected an unencrypted message; only pairing may be sent in the clear.".to_string())
+                Err(
+                    "Rejected an unencrypted message; only pairing may be sent in the clear."
+                        .to_string(),
+                )
             }
         }
-        TransportEnvelope::Encrypted { peer_id, nonce, body } => {
+        TransportEnvelope::Encrypted {
+            peer_id,
+            nonce,
+            body,
+        } => {
             let peer = get_peer(state, &peer_id)?;
             let secret = peer
                 .shared_secret
                 .as_deref()
                 .ok_or_else(|| format!("{} does not have a shared secret yet.", peer.name))?;
             let key = decode_secret(secret)?;
-            let nonce = BASE64.decode(nonce).map_err(|err| err.to_string())?;
+            let nonce = decode_nonce(&nonce)?;
             let body = BASE64.decode(body).map_err(|err| err.to_string())?;
             let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|err| err.to_string())?;
             let plaintext = cipher
                 .decrypt(Nonce::from_slice(&nonce), body.as_ref())
                 .map_err(|err| err.to_string())?;
-            serde_json::from_slice(&plaintext).map_err(|err| err.to_string())
+            let message: WireMessage =
+                serde_json::from_slice(&plaintext).map_err(|err| err.to_string())?;
+            verify_authenticated_peer(&peer_id, &message)?;
+            Ok(message)
         }
     }
 }
@@ -1856,6 +2240,23 @@ fn decode_secret(secret: &str) -> AppResult<Vec<u8>> {
     }
 }
 
+fn decode_nonce(nonce: &str) -> AppResult<[u8; 12]> {
+    BASE64
+        .decode(nonce)
+        .map_err(|err| err.to_string())?
+        .try_into()
+        .map_err(|_| "Encrypted nonce has an invalid length.".to_string())
+}
+
+fn verify_authenticated_peer(authenticated_peer_id: &str, message: &WireMessage) -> AppResult<()> {
+    let claimed_peer_id = envelope_peer_id(message)?;
+    if claimed_peer_id == authenticated_peer_id {
+        Ok(())
+    } else {
+        Err("Encrypted sender id did not match the message body.".to_string())
+    }
+}
+
 fn secret_array(secret: &str) -> AppResult<[u8; 32]> {
     decode_secret(secret)?
         .try_into()
@@ -1888,19 +2289,23 @@ fn local_discovery_packet(state: &State<AppState>) -> AppResult<DiscoveryPacket>
 }
 
 fn existing_device_id(state: &State<AppState>) -> AppResult<String> {
-    Ok(state.inner.lock().map_err(lock_err)?.setup.device_id.clone())
+    Ok(state
+        .inner
+        .lock()
+        .map_err(lock_err)?
+        .setup
+        .device_id
+        .clone())
 }
 
 fn existing_identity_secret(state: &State<AppState>) -> AppResult<String> {
-    Ok(state.inner.lock().map_err(lock_err)?.setup.identity_secret.clone())
-}
-
-fn peer_public_key(peers: &[PeerDevice], peer_id: &str) -> AppResult<String> {
-    peers
-        .iter()
-        .find(|peer| peer.id == peer_id)
-        .and_then(|peer| peer.public_key.clone())
-        .ok_or_else(|| "Peer public key is missing.".to_string())
+    Ok(state
+        .inner
+        .lock()
+        .map_err(lock_err)?
+        .setup
+        .identity_secret
+        .clone())
 }
 
 fn get_peer(state: &State<AppState>, peer_id: &str) -> AppResult<PeerDevice> {
@@ -1960,7 +2365,8 @@ fn ensure_paired(state: &State<AppState>, peer_id: &str) -> AppResult<()> {
 }
 
 fn emit_transfer(app: &AppHandle, transfer: TransferProgress) -> AppResult<()> {
-    app.emit("transfer-progress", transfer).map_err(|err| err.to_string())
+    app.emit("transfer-progress", transfer)
+        .map_err(|err| err.to_string())
 }
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -1978,7 +2384,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => reveal_main_window(app),
-            "quit" => app.exit(0),
+            "quit" => quit_app(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -1993,6 +2399,26 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         })
         .build(app)?;
     Ok(())
+}
+
+/// Fully shut the app down from the tray. We destroy the webview windows *before*
+/// exiting so WebView2 tears down its host processes (msedgewebview2.exe) cleanly.
+/// A bare `app.exit(0)` does a fast process exit while the windows are still open,
+/// orphaning those host processes — and on Windows they keep the per-app WebView2
+/// user-data dir (EBWebView) locked. The *next* launch's WebView2 then can't open
+/// that locked dir, so the new window hangs forever on the "Starting SimplePass"
+/// loading screen until the orphan finally dies. destroy() force-closes without the
+/// CloseRequested handler, which would otherwise just hide the window. The short
+/// delay lets the host processes exit before we terminate.
+fn quit_app(app: &AppHandle) {
+    for (_, window) in app.webview_windows() {
+        let _ = window.destroy();
+    }
+    let app = app.clone();
+    thread::spawn(move || {
+        thread::sleep(std::time::Duration::from_millis(300));
+        app.exit(0);
+    });
 }
 
 fn reveal_main_window(app: &AppHandle) {
@@ -2038,7 +2464,12 @@ const WIDGET_IDLE_SIZE: f64 = 72.0;
 /// so they must be restored as `PhysicalPosition` — restoring them as logical
 /// scaled them by the display factor on HiDPI screens and shoved the widget
 /// off-screen, which is why it "stopped showing up".
-fn open_widget_window(app: &AppHandle, x: Option<f64>, y: Option<f64>, center: bool) -> AppResult<()> {
+fn open_widget_window(
+    app: &AppHandle,
+    x: Option<f64>,
+    y: Option<f64>,
+    center: bool,
+) -> AppResult<()> {
     let window = app
         .get_webview_window(WIDGET_LABEL)
         .ok_or_else(|| "Floating widget window is unavailable.".to_string())?;
@@ -2092,7 +2523,11 @@ fn close_widget_window(app: &AppHandle) {
 
 /// Toggle the floating desktop icon on/off and persist the preference.
 #[tauri::command]
-fn set_floating_icon(app: AppHandle, state: State<AppState>, enabled: bool) -> AppResult<SetupResponse> {
+fn set_floating_icon(
+    app: AppHandle,
+    state: State<AppState>,
+    enabled: bool,
+) -> AppResult<SetupResponse> {
     let response = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
         persisted.setup.floating_icon = enabled;
@@ -2117,10 +2552,29 @@ fn set_floating_icon(app: AppHandle, state: State<AppState>, enabled: bool) -> A
 /// viewer as they arrive. Off by default; files with no associated handler are
 /// skipped (see `auto_open_received_file`).
 #[tauri::command]
-fn set_auto_open(app: AppHandle, state: State<AppState>, enabled: bool) -> AppResult<SetupResponse> {
+fn set_auto_open(
+    app: AppHandle,
+    state: State<AppState>,
+    enabled: bool,
+) -> AppResult<SetupResponse> {
     let response = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
         persisted.setup.auto_open = enabled;
+        save_state(&state.path, &persisted)?;
+        setup_response(&persisted.setup)
+    };
+    let _ = app.emit("setup-changed", response.clone());
+    Ok(response)
+}
+
+/// Set the UI color theme ("light" or "dark") and persist the preference. Any
+/// unrecognized value falls back to "light".
+#[tauri::command]
+fn set_theme(app: AppHandle, state: State<AppState>, theme: String) -> AppResult<SetupResponse> {
+    let theme = if theme == "dark" { "dark" } else { "light" }.to_string();
+    let response = {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        persisted.setup.theme = theme;
         save_state(&state.path, &persisted)?;
         setup_response(&persisted.setup)
     };
@@ -2140,9 +2594,109 @@ fn collapse_widget(app: AppHandle) -> AppResult<()> {
     Ok(())
 }
 
+/// Decide which side of the icon the status pill will expand toward, given the
+/// resting top-left `anchor`, without touching the window. Returns the side plus,
+/// for a leftward grow, the new top-left x to move to (the window shifts left by the
+/// extra width so the icon stays put and the pill fills the space to its left).
+///
+/// Multi-monitor safe: bounds come from the widget's current monitor, not the
+/// primary display. Falls back to growing right (top-left fixed) when there is no
+/// monitor info or the icon isn't near the right edge.
+fn widget_grow_plan(
+    win: &tauri::WebviewWindow,
+    anchor: PhysicalPosition<i32>,
+    active_width: f64,
+) -> (bool, i32) {
+    let monitor = match win.current_monitor() {
+        Ok(Some(m)) => m,
+        _ => return (false, anchor.x),
+    };
+    let scale = monitor.scale_factor();
+    let idle_px = (WIDGET_IDLE_SIZE * scale).round() as i32;
+    let active_px = (active_width * scale).round() as i32;
+    let extra_px = (active_px - idle_px).max(0);
+    let left_bound = monitor.position().x;
+    let right_bound = left_bound + monitor.size().width as i32;
+
+    // Grow left only when the expanded window would overflow the right edge but there
+    // is room once it's shifted back.
+    let grow_left = anchor.x + active_px > right_bound && anchor.x - extra_px >= left_bound;
+    if grow_left {
+        ((true), (anchor.x - extra_px).max(left_bound))
+    } else {
+        (false, anchor.x)
+    }
+}
+
+/// Expand the widget window to show the status pill, or collapse it back to the
+/// resting icon. Split into a non-mutating *decide* phase (`apply = false`) and an
+/// *apply* phase (`apply = true`) so the webview can commit its layout flip (icon to
+/// the right, pill to the left, for a leftward grow) *before* the window actually
+/// moves — otherwise the icon flashes on the wrong side for a frame. The frontend
+/// calls decide → flip its DOM → apply.
+///
+/// The window grows sideways from the resting `WIDGET_IDLE_SIZE` square to
+/// `active_width`. Growing right keeps the top-left fixed; growing left moves the
+/// window so the icon stays put. Returns the side the pill ends up on
+/// ("left"/"right").
+#[tauri::command]
+fn set_widget_active(
+    app: AppHandle,
+    state: State<AppState>,
+    active: bool,
+    active_width: f64,
+    apply: bool,
+) -> AppResult<String> {
+    let win = app
+        .get_webview_window(WIDGET_LABEL)
+        .ok_or_else(|| "Floating widget window is unavailable.".to_string())?;
+
+    if !active {
+        // Collapse: restore the resting square at the captured anchor, then clear it.
+        let anchor = state.widget_anchor.lock().map_err(lock_err)?.take();
+        let _ = win.set_size(LogicalSize::new(WIDGET_IDLE_SIZE, WIDGET_IDLE_SIZE));
+        if let Some(pos) = anchor {
+            let _ = win.set_position(pos);
+        }
+        state.widget_active.store(false, Ordering::SeqCst);
+        return Ok("right".to_string());
+    }
+
+    // Capture the resting top-left before any resize/move so collapse can restore it,
+    // and so both phases plan against the same anchor. Only capture the first time we
+    // expand (the decide phase): an apply must not re-read an already-moved position.
+    let anchor = {
+        let mut guard = state.widget_anchor.lock().map_err(lock_err)?;
+        if guard.is_none() {
+            *guard = Some(win.outer_position().map_err(|err| err.to_string())?);
+        }
+        guard.expect("anchor set above")
+    };
+    state.widget_active.store(true, Ordering::SeqCst);
+
+    let (grow_left, new_x) = widget_grow_plan(&win, anchor, active_width);
+
+    if apply {
+        if grow_left {
+            // Move left first (still the resting size), then grow back to the right.
+            // The webview has already flipped to a right-anchored layout, so the icon
+            // lands exactly where it rested with the pill filling the space to its left.
+            let _ = win.set_position(PhysicalPosition::new(new_x, anchor.y));
+        }
+        let _ = win.set_size(LogicalSize::new(active_width, WIDGET_IDLE_SIZE));
+    }
+
+    Ok(if grow_left { "left" } else { "right" }.to_string())
+}
+
 /// Persist where the user dragged the floating icon, so it returns there next time.
+/// Ignored while the widget is expanded for the status pill: those moves are
+/// programmatic (see `set_widget_active`) and would overwrite the resting anchor.
 #[tauri::command]
 fn save_widget_position(state: State<AppState>, x: f64, y: f64) -> AppResult<()> {
+    if state.widget_active.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let mut persisted = state.inner.lock().map_err(lock_err)?;
     persisted.setup.widget_x = Some(x);
     persisted.setup.widget_y = Some(y);
@@ -2166,13 +2720,53 @@ fn is_http_url(url: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
+fn validate_message_text(text: &str) -> AppResult<()> {
+    if text.len() > MAX_MESSAGE_TEXT_LEN {
+        Err("Message is too long.".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_link_url(url: &str) -> AppResult<()> {
+    if url.len() > MAX_LINK_URL_LEN {
+        return Err("Link is too long.".to_string());
+    }
+    if !is_http_url(url) {
+        return Err("Only http(s) links can be shared.".to_string());
+    }
+    Ok(())
+}
+
+fn is_valid_avatar(value: &str) -> bool {
+    if value.len() > MAX_AVATAR_LEN {
+        return false;
+    }
+    let Some((header, body)) = value.split_once(',') else {
+        return false;
+    };
+    if body.is_empty() {
+        return false;
+    }
+    let header = header.to_ascii_lowercase();
+    if !matches!(
+        header.as_str(),
+        "data:image/png;base64"
+            | "data:image/jpeg;base64"
+            | "data:image/jpg;base64"
+            | "data:image/webp;base64"
+            | "data:image/gif;base64"
+    ) {
+        return false;
+    }
+    BASE64.decode(body.as_bytes()).is_ok()
+}
+
 /// Opens a received/clicked link, but only if it is an http(s) URL. Invoked from
 /// the UI when the user clicks a link bubble.
 #[tauri::command]
 fn open_link(url: String) -> AppResult<()> {
-    if !is_http_url(&url) {
-        return Err("Only http(s) links can be opened.".to_string());
-    }
+    validate_link_url(&url)?;
     open_url(&url)
 }
 
@@ -2232,7 +2826,8 @@ fn receive_file_start(
     let peer_name = get_peer(state, &peer_id)
         .map(|peer| peer.name)
         .unwrap_or_else(|_| "Unknown device".to_string());
-    let downloads = dirs::download_dir().ok_or_else(|| "Downloads folder was not found.".to_string())?;
+    let downloads =
+        dirs::download_dir().ok_or_else(|| "Downloads folder was not found.".to_string())?;
     // Atomically reserves + creates the empty destination so chunks can be
     // appended in order and concurrent transfers can't collide on one path.
     let destination =
@@ -2249,6 +2844,7 @@ fn receive_file_start(
         incoming.insert(
             transfer_id.clone(),
             Arc::new(Mutex::new(IncomingFile {
+                peer_id: peer_id.clone(),
                 path: destination,
                 file,
                 expected_size: total_size,
@@ -2293,13 +2889,19 @@ fn receive_file_chunk(
 
     let outcome: Result<(u8, String, String), PathBuf> = {
         let mut entry = entry_arc.lock().map_err(lock_err)?;
+        if entry.peer_id != peer_id.as_str() {
+            return Err("Received a chunk for a different peer's transfer.".to_string());
+        }
         // Refuse to write past the size the sender declared in FileStart. Stops a
         // peer from streaming unbounded data into the Downloads folder. Abort the
         // transfer and remove the partial file.
         if entry.received_size + bytes.len() as u64 > entry.expected_size {
             Err(entry.path.clone())
         } else {
-            entry.file.write_all(&bytes).map_err(|err| err.to_string())?;
+            entry
+                .file
+                .write_all(&bytes)
+                .map_err(|err| err.to_string())?;
             entry.received_size += bytes.len() as u64;
             let progress = (((entry.received_size as f64) / (entry.expected_size.max(1) as f64))
                 * 100.0)
@@ -2343,11 +2945,21 @@ fn receive_file_end(
 ) -> AppResult<()> {
     ensure_paired(state, &peer_id)?;
     let entry_arc = {
-        let mut incoming = state.incoming_files.lock().map_err(lock_err)?;
-        incoming.remove(&transfer_id)
+        let incoming = state.incoming_files.lock().map_err(lock_err)?;
+        incoming.get(&transfer_id).cloned()
     };
     let entry_arc =
         entry_arc.ok_or_else(|| "Received an end marker for an unknown transfer.".to_string())?;
+    {
+        let entry = entry_arc.lock().map_err(lock_err)?;
+        if entry.peer_id != peer_id.as_str() {
+            return Err("Received an end marker for a different peer's transfer.".to_string());
+        }
+    }
+    {
+        let mut incoming = state.incoming_files.lock().map_err(lock_err)?;
+        incoming.remove(&transfer_id);
+    }
     // We hold the only remaining `Arc`; copy out what we need, then drop the guard
     // (and with it the append handle, flushing/closing the file) before continuing.
     let (path, file_name, expected_size, peer_name) = {
@@ -2417,13 +3029,23 @@ fn receive_file_cancel(
 ) -> AppResult<()> {
     ensure_paired(state, &peer_id)?;
     let entry_arc = {
-        let mut incoming = state.incoming_files.lock().map_err(lock_err)?;
-        incoming.remove(&transfer_id)
+        let incoming = state.incoming_files.lock().map_err(lock_err)?;
+        incoming.get(&transfer_id).cloned()
     };
     // Nothing reserved (e.g. cancel arrived before FileStart) — nothing to clean up.
     let Some(entry_arc) = entry_arc else {
         return Ok(());
     };
+    {
+        let entry = entry_arc.lock().map_err(lock_err)?;
+        if entry.peer_id != peer_id.as_str() {
+            return Err("Received a cancel for a different peer's transfer.".to_string());
+        }
+    }
+    {
+        let mut incoming = state.incoming_files.lock().map_err(lock_err)?;
+        incoming.remove(&transfer_id);
+    }
     let (path, file_name, peer_name) = {
         let entry = entry_arc.lock().map_err(lock_err)?;
         (
@@ -2461,11 +3083,7 @@ fn receive_file_cancel(
 /// falling back to a fixed name. The result is guaranteed to contain no path
 /// separators, so the subsequent `downloads.join(..)` stays inside `downloads`.
 fn sanitize_file_name(file_name: &str) -> String {
-    let last = file_name
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or("")
-        .trim();
+    let last = file_name.rsplit(['/', '\\']).next().unwrap_or("").trim();
     if last.is_empty() || last == "." || last == ".." {
         "received-file".to_string()
     } else {
@@ -2493,7 +3111,11 @@ fn available_destination(downloads: &Path, file_name: &str) -> std::io::Result<P
     let mut counter = 1;
 
     loop {
-        match fs::OpenOptions::new().write(true).create_new(true).open(&candidate) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
             Ok(_) => return Ok(candidate),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 let next_name = match extension {
@@ -2544,6 +3166,13 @@ fn trim_transfers(state: &mut PersistedState) {
     }
 }
 
+fn trim_messages(state: &mut PersistedState) {
+    let len = state.messages.len();
+    if len > MAX_PERSISTED_MESSAGES {
+        state.messages.drain(0..len - MAX_PERSISTED_MESSAGES);
+    }
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2579,11 +3208,19 @@ mod tests {
             peer_id: "sender-device".to_string(),
             text: "hello".to_string(),
         };
-        let envelope = encrypt_message(envelope_peer_id(&message).expect("peer id"), &secret, &message)
-            .expect("encrypted envelope");
+        let envelope = encrypt_message(
+            envelope_peer_id(&message).expect("peer id"),
+            &secret,
+            &message,
+        )
+        .expect("encrypted envelope");
 
         match envelope {
-            TransportEnvelope::Encrypted { peer_id, nonce, body } => {
+            TransportEnvelope::Encrypted {
+                peer_id,
+                nonce,
+                body,
+            } => {
                 assert_eq!(peer_id, "sender-device");
                 assert!(!nonce.is_empty());
                 assert!(!body.is_empty());
@@ -2636,8 +3273,12 @@ mod tests {
             port: TRANSPORT_PORT,
             request: false,
         };
-        assert!(plain_envelope_allowed(&WireMessage::PairRequest { device: device.clone() }));
-        assert!(plain_envelope_allowed(&WireMessage::PairAccepted { device }));
+        assert!(plain_envelope_allowed(&WireMessage::PairRequest {
+            device: device.clone()
+        }));
+        assert!(plain_envelope_allowed(&WireMessage::PairAccepted {
+            device
+        }));
 
         // Chat, links, files, typing, profile must never be accepted in the clear.
         assert!(!plain_envelope_allowed(&WireMessage::Chat {
@@ -2652,15 +3293,35 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_sender_id_must_match_message_body() {
+        let message = WireMessage::Chat {
+            peer_id: "claimed-peer".to_string(),
+            text: "hello".to_string(),
+        };
+
+        assert!(verify_authenticated_peer("claimed-peer", &message).is_ok());
+        assert!(verify_authenticated_peer("other-peer", &message).is_err());
+    }
+
+    #[test]
+    fn encrypted_nonce_length_is_checked_without_panic() {
+        assert!(decode_nonce(&BASE64.encode([0_u8; 12])).is_ok());
+        assert!(decode_nonce(&BASE64.encode([0_u8; 11])).is_err());
+        assert!(decode_nonce("not base64").is_err());
+    }
+
+    #[test]
     fn available_destination_renames_conflicts() {
         let temp_dir = std::env::temp_dir().join(format!("simplepass-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).expect("temp dir");
         fs::write(temp_dir.join("report.pdf"), b"first").expect("seed file");
 
-        let destination =
-            available_destination(&temp_dir, "report.pdf").expect("destination");
+        let destination = available_destination(&temp_dir, "report.pdf").expect("destination");
 
-        assert_eq!(destination.file_name().and_then(|name| name.to_str()), Some("report (1).pdf"));
+        assert_eq!(
+            destination.file_name().and_then(|name| name.to_str()),
+            Some("report (1).pdf")
+        );
         fs::remove_dir_all(temp_dir).expect("cleanup");
     }
 
@@ -2701,6 +3362,23 @@ mod tests {
             avatar: None,
             last_seen: 1_000,
         }
+    }
+
+    #[test]
+    fn pending_and_paired_peer_keys_are_pinned() {
+        let mut unpaired = peer_at("peer", "10.0.0.1", "online");
+        unpaired.public_key = Some("old-key".to_string());
+        assert!(can_replace_peer_public_key(&unpaired, "new-key"));
+
+        let mut pending = unpaired.clone();
+        pending.trust_state = "pending".to_string();
+        assert!(!can_replace_peer_public_key(&pending, "new-key"));
+        assert!(can_replace_peer_public_key(&pending, "old-key"));
+
+        let mut paired = unpaired;
+        paired.trust_state = "paired".to_string();
+        paired.shared_secret = Some(new_shared_secret());
+        assert!(!can_replace_peer_public_key(&paired, "new-key"));
     }
 
     #[test]
@@ -2745,14 +3423,68 @@ mod tests {
         trim_transfers(&mut state);
         assert_eq!(state.transfers.len(), MAX_PERSISTED_TRANSFERS);
         // Oldest dropped, newest kept.
-        assert_eq!(state.transfers.last().unwrap().id, (MAX_PERSISTED_TRANSFERS + 24).to_string());
+        assert_eq!(
+            state.transfers.last().unwrap().id,
+            (MAX_PERSISTED_TRANSFERS + 24).to_string()
+        );
+    }
+
+    #[test]
+    fn trim_messages_caps_history() {
+        let mut state = PersistedState::default();
+        for index in 0..(MAX_PERSISTED_MESSAGES + 25) {
+            state.messages.push(make_chat_message(
+                "p".to_string(),
+                "received",
+                "text",
+                index.to_string(),
+            ));
+        }
+        trim_messages(&mut state);
+        assert_eq!(state.messages.len(), MAX_PERSISTED_MESSAGES);
+        assert_eq!(
+            state.messages.last().unwrap().text,
+            (MAX_PERSISTED_MESSAGES + 24).to_string()
+        );
+    }
+
+    #[test]
+    fn message_and_link_lengths_are_bounded() {
+        assert!(validate_message_text(&"a".repeat(MAX_MESSAGE_TEXT_LEN)).is_ok());
+        assert!(validate_message_text(&"a".repeat(MAX_MESSAGE_TEXT_LEN + 1)).is_err());
+        assert!(validate_link_url("https://example.com").is_ok());
+        assert!(validate_link_url("file:///tmp/nope").is_err());
+        assert!(validate_link_url(&format!(
+            "https://example.com/{}",
+            "a".repeat(MAX_LINK_URL_LEN)
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn avatar_must_be_small_data_image() {
+        let valid = format!("data:image/png;base64,{}", BASE64.encode(b"avatar"));
+        assert!(is_valid_avatar(&valid));
+        assert!(!is_valid_avatar("https://example.com/avatar.png"));
+        assert!(!is_valid_avatar(&format!(
+            "data:image/svg+xml;base64,{}",
+            BASE64.encode(b"<svg/>")
+        )));
+        assert!(!is_valid_avatar(&format!(
+            "data:image/png;base64,{}",
+            BASE64.encode(vec![0_u8; MAX_AVATAR_LEN])
+        )));
     }
 
     #[test]
     fn prune_keeps_online_and_other_host_peers() {
         let mut state = PersistedState::default();
-        state.peers.push(peer_at("online-same-host", "192.168.1.67", "online"));
-        state.peers.push(peer_at("offline-other-host", "192.168.1.50", "offline"));
+        state
+            .peers
+            .push(peer_at("online-same-host", "192.168.1.67", "online"));
+        state
+            .peers
+            .push(peer_at("offline-other-host", "192.168.1.50", "offline"));
         state.peers.push(peer_at("new", "192.168.1.67", "online"));
 
         let removed = prune_offline_host_duplicates(&mut state, "new", "192.168.1.67");
@@ -2781,7 +3513,10 @@ mod tests {
         // Traversal and absolute/UNC paths collapse to a bare component.
         assert_eq!(sanitize_file_name("../../etc/passwd"), "passwd");
         assert_eq!(sanitize_file_name(r"..\..\Startup\evil.bat"), "evil.bat");
-        assert_eq!(sanitize_file_name(r"C:\Windows\system32\calc.exe"), "calc.exe");
+        assert_eq!(
+            sanitize_file_name(r"C:\Windows\system32\calc.exe"),
+            "calc.exe"
+        );
         assert_eq!(sanitize_file_name(r"\\attacker\share\x.txt"), "x.txt");
         assert_eq!(sanitize_file_name("plain.pdf"), "plain.pdf");
         // Degenerate names fall back to a fixed safe name.
@@ -2798,7 +3533,10 @@ mod tests {
         fs::create_dir_all(&temp_dir).expect("temp dir");
         let dest = available_destination(&temp_dir, "../../escape.txt").expect("destination");
         assert_eq!(dest.parent(), Some(temp_dir.as_path()));
-        assert_eq!(dest.file_name().and_then(|n| n.to_str()), Some("escape.txt"));
+        assert_eq!(
+            dest.file_name().and_then(|n| n.to_str()),
+            Some("escape.txt")
+        );
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
@@ -2811,8 +3549,18 @@ mod tests {
         assert!(is_safe_to_auto_open(Path::new("doc.pdf")));
         // Executables / scripts / shortcuts / markup are never auto-opened.
         for unsafe_name in [
-            "invoice.exe", "run.bat", "go.cmd", "x.ps1", "setup.msi", "link.lnk",
-            "site.url", "page.hta", "index.html", "vector.svg", "macro.docm", "noext",
+            "invoice.exe",
+            "run.bat",
+            "go.cmd",
+            "x.ps1",
+            "setup.msi",
+            "link.lnk",
+            "site.url",
+            "page.hta",
+            "index.html",
+            "vector.svg",
+            "macro.docm",
+            "noext",
         ] {
             assert!(
                 !is_safe_to_auto_open(Path::new(unsafe_name)),
@@ -2847,7 +3595,10 @@ mod tests {
     #[test]
     fn clamp_device_name_bounds_length() {
         let long = "a".repeat(MAX_DEVICE_NAME_LEN + 50);
-        assert_eq!(clamp_device_name(&long).chars().count(), MAX_DEVICE_NAME_LEN);
+        assert_eq!(
+            clamp_device_name(&long).chars().count(),
+            MAX_DEVICE_NAME_LEN
+        );
         assert_eq!(clamp_device_name("  Desk  "), "Desk");
         assert_eq!(clamp_device_name("   "), "Unknown device");
     }

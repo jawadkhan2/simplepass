@@ -154,8 +154,9 @@ function resizeImageToDataUrl(file: File, size = 128): Promise<string> {
 }
 
 function Avatar({ src, size = 34 }: { src?: string | null; size?: number }) {
-  if (src) {
-    return <img className="avatar-img" src={src} alt="" draggable={false} />;
+  const safeSrc = src && /^data:image\/(?:png|jpe?g|webp|gif);base64,/i.test(src) ? src : null;
+  if (safeSrc) {
+    return <img className="avatar-img" src={safeSrc} alt="" draggable={false} />;
   }
   return <Laptop size={size} />;
 }
@@ -226,7 +227,28 @@ export default function App() {
   );
 
   useEffect(() => {
-    void api.getSetupState().then(setSetup);
+    // Retry the setup fetch until it resolves. After an OTA relaunch the first IPC
+    // call can be lost or hang while the old instance is still exiting; a single
+    // un-retried invoke would leave the UI stuck on the loading screen forever. The
+    // per-attempt timeout covers a *hung* call (which never rejects on its own).
+    let setupCancelled = false;
+    void (async () => {
+      while (!setupCancelled) {
+        try {
+          const next = await Promise.race([
+            api.getSetupState(),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error("timeout")), 3000)
+            ),
+          ]);
+          if (!setupCancelled) setSetup(next);
+          return;
+        } catch {
+          if (setupCancelled) return;
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+      }
+    })();
     void api.listPeers().then(setPeers);
 
     const unsubs = [
@@ -247,12 +269,26 @@ export default function App() {
         if (message.direction === "received") void notifyIfHidden(message);
       }),
       events.onTransfer((transfer) => {
-        // The dock only shows in-flight transfers. Finished rows (complete/failed)
-        // drop off — the chat retains the permanent record of files and links.
+        // The dock only shows in-flight transfers. A completed row is held for a
+        // beat so its success check can play, then dropped; failed/cancelled rows
+        // drop immediately. The chat retains the permanent record either way.
         setTransfers((current) => {
-          const rest = current.filter((item) => item.id !== transfer.id);
-          if (["complete", "failed", "cancelled"].includes(transfer.state)) return rest;
-          return [transfer, ...rest].slice(0, TRANSFER_LIMIT);
+          if (["failed", "cancelled"].includes(transfer.state)) {
+            return current.filter((item) => item.id !== transfer.id);
+          }
+          if (transfer.state === "complete") {
+            window.setTimeout(() => {
+              setTransfers((now) => now.filter((item) => item.id !== transfer.id));
+            }, 1500);
+          }
+          // Update in place to keep a stable row order. Reordering on every
+          // progress tick makes concurrent transfers swap positions rapidly
+          // (flicker) and moves the cancel button out from under the cursor.
+          const index = current.findIndex((item) => item.id === transfer.id);
+          if (index === -1) return [transfer, ...current].slice(0, TRANSFER_LIMIT);
+          const next = current.slice();
+          next[index] = transfer;
+          return next;
         });
       }),
       events.onTyping(({ peerId, isTyping }) => {
@@ -268,11 +304,25 @@ export default function App() {
     ];
 
     return () => {
+      setupCancelled = true;
       void Promise.all(unsubs.map(async (unsubscribe) => (await unsubscribe)()));
     };
   }, []);
 
   useEffect(() => startAutoUpdate(setUpdate), []);
+
+  // Apply the persisted color theme to the document root, which flips the CSS
+  // variables in styles.css. Cache it so main.tsx can paint the right theme on
+  // the next launch before React mounts (avoids a light→dark flash).
+  useEffect(() => {
+    const theme = setup?.theme === "dark" ? "dark" : "light";
+    document.documentElement.dataset.theme = theme;
+    try {
+      localStorage.setItem("sp-theme", theme);
+    } catch {
+      // Private-mode / disabled storage: theme still works this session.
+    }
+  }, [setup?.theme]);
 
   // A click on an incoming-message toast brings the main window forward. The
   // action listener is process-wide, so it is registered once.
@@ -484,7 +534,12 @@ export default function App() {
             ))}
             {peers.length === 0 && (
               <div className="empty-state">
-                <Monitor size={42} />
+                <div className="radar">
+                  <span />
+                  <span />
+                  <span />
+                  <Monitor size={42} />
+                </div>
                 <p>Looking for SimplePass computers on this network.</p>
               </div>
             )}
@@ -509,7 +564,11 @@ export default function App() {
                 <strong>{transfer.peerName}</strong>
                 <span>{transfer.label}</span>
               </div>
-              <progress value={transfer.progress} max={100} />
+              {transfer.state === "complete" ? (
+                <div className="transfer-done"><Check size={15} /> Sent</div>
+              ) : (
+                <progress value={transfer.progress} max={100} />
+              )}
               <small>{transfer.state}</small>
               {(transfer.state === "sending" || transfer.state === "queued") && (
                 <button
@@ -536,7 +595,11 @@ export default function App() {
         <PairingModal
           peer={pairingRequest}
           onAccept={() => {
-            api.acceptPairing(pairingRequest.id)
+            if (!pairingRequest.publicKey) {
+              setError("This pairing request is missing a verification key.");
+              return;
+            }
+            api.acceptPairing(pairingRequest.id, pairingRequest.publicKey)
               .then(() => setPairingRequest(null))
               .catch((err) => setError(String(err)));
           }}
@@ -626,6 +689,9 @@ function DeviceTile(props: {
       }`}
       onClick={props.onSelect}
     >
+      {props.selected && (
+        <span className="tile-check"><Check size={15} strokeWidth={3} /></span>
+      )}
       <div className="device-avatar">
         <Avatar src={peer.avatar} size={34} />
       </div>
@@ -875,6 +941,7 @@ function SettingsPanel(props: {
   const [avatar, setAvatar] = useState<string | null>(props.setup.avatar ?? null);
   const [floatingIcon, setFloatingIcon] = useState(props.setup.floatingIcon ?? false);
   const [autoOpen, setAutoOpen] = useState(props.setup.autoOpen ?? false);
+  const [theme, setTheme] = useState<"light" | "dark">(props.setup.theme ?? "light");
   // Serialize floating-icon toggles: rapid clicks fire overlapping set_floating_icon
   // commands that the backend can complete out of order, so a late show()/hide()
   // wins over the user's final choice. Run one command at a time and always reapply
@@ -957,6 +1024,21 @@ function SettingsPanel(props: {
     }
   }
 
+  async function toggleTheme(dark: boolean) {
+    const next = dark ? "dark" : "light";
+    setTheme(next); // optimistic
+    document.documentElement.dataset.theme = next; // apply instantly
+    try {
+      const updated = await api.setTheme(next);
+      props.onSetup(updated);
+    } catch (err) {
+      const reverted = dark ? "light" : "dark";
+      setTheme(reverted);
+      document.documentElement.dataset.theme = reverted;
+      props.onError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function clearChat() {
     try {
       await api.clearMessages();
@@ -1035,6 +1117,14 @@ function SettingsPanel(props: {
             onChange={(event) => void toggleAutoOpen(event.target.checked)}
           />
           Open received files &amp; links automatically
+        </label>
+        <label className="check-row">
+          <input
+            type="checkbox"
+            checked={theme === "dark"}
+            onChange={(event) => void toggleTheme(event.target.checked)}
+          />
+          Use dark theme
         </label>
 
         {props.setup.publicKey && (

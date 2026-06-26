@@ -9,6 +9,7 @@ export interface SetupState {
   avatar?: string | null;
   floatingIcon?: boolean;
   autoOpen?: boolean;
+  theme?: "light" | "dark";
   publicKey?: string | null;
 }
 
