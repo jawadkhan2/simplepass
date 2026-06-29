@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   Check,
   Download,
   FileText,
@@ -13,6 +14,7 @@ import {
   Settings,
   Share2,
   Square,
+  WifiOff,
   X
 } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
@@ -269,13 +271,9 @@ export default function App() {
         if (message.direction === "received") void notifyIfHidden(message);
       }),
       events.onTransfer((transfer) => {
-        // The dock only shows in-flight transfers. A completed row is held for a
-        // beat so its success check can play, then dropped; failed/cancelled rows
-        // drop immediately. The chat retains the permanent record either way.
+        // Completed rows are held for a beat so the success check can play. Failed
+        // rows stay until dismissed so offline/asleep receiver cases are visible.
         setTransfers((current) => {
-          if (["failed", "cancelled"].includes(transfer.state)) {
-            return current.filter((item) => item.id !== transfer.id);
-          }
           if (transfer.state === "complete") {
             window.setTimeout(() => {
               setTransfers((now) => now.filter((item) => item.id !== transfer.id));
@@ -440,6 +438,10 @@ export default function App() {
     return targetPeers.map((item) => item.id);
   }
 
+  function dismissTransfer(id: string) {
+    setTransfers((current) => current.filter((item) => item.id !== id));
+  }
+
   async function openShareDialog(peer: PeerDevice) {
     const peerIds = targetPeerIdsFor(peer);
     if (peerIds.length === 0) return;
@@ -559,22 +561,35 @@ export default function App() {
       {transfers.length > 0 && (
         <section className="transfer-dock">
           {transfers.map((transfer) => (
-            <div className="transfer-row" key={transfer.id}>
+            <div className={`transfer-row ${transfer.state}`} key={transfer.id}>
               <div>
                 <strong>{transfer.peerName}</strong>
                 <span>{transfer.label}</span>
               </div>
               {transfer.state === "complete" ? (
                 <div className="transfer-done"><Check size={15} /> Sent</div>
+              ) : transfer.state === "failed" ? (
+                <div className="transfer-failed"><AlertTriangle size={15} /> Not sent</div>
+              ) : transfer.state === "cancelled" ? (
+                <div className="transfer-cancelled">Cancelled</div>
               ) : (
                 <progress value={transfer.progress} max={100} />
               )}
-              <small>{transfer.state}</small>
+              <small title={transfer.error}>{transfer.error ?? transfer.state}</small>
               {(transfer.state === "sending" || transfer.state === "queued") && (
                 <button
                   className="transfer-cancel"
                   title="Cancel transfer"
                   onClick={() => api.cancelFileSend(transfer.id.split(":")[0]).catch((err) => setError(String(err)))}
+                >
+                  <X size={14} />
+                </button>
+              )}
+              {(transfer.state === "failed" || transfer.state === "cancelled") && (
+                <button
+                  className="transfer-cancel"
+                  title="Dismiss transfer"
+                  onClick={() => dismissTransfer(transfer.id)}
                 >
                   <X size={14} />
                 </button>
@@ -757,12 +772,22 @@ function PairingModal({ peer, onAccept, onDeny }: { peer: PeerDevice; onAccept: 
 }
 
 function MessageBubble({ message }: { message: ChatMessage }) {
+  const failed = message.direction === "sent" && message.deliveryState === "failed";
+  const failureNote = failed ? (
+    <span className="message-status">
+      <AlertTriangle size={13} />
+      {message.error ?? "Not delivered."}
+    </span>
+  ) : null;
+
   if (message.kind === "file") {
     const path = message.filePath;
     const openable = Boolean(path);
     return (
       <div
-        className={`message file-message ${message.direction}${openable ? " openable" : ""}`}
+        className={`message file-message ${message.direction}${openable ? " openable" : ""}${
+          failed ? " failed" : ""
+        }`}
         title={openable ? "Open file" : undefined}
         role={openable ? "button" : undefined}
         tabIndex={openable ? 0 : undefined}
@@ -780,6 +805,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           <small>{formatBytes(message.fileSize)}{message.direction === "received" ? " · saved to Downloads" : ""}</small>
         </div>
         {openable && <span className="file-open">Open</span>}
+        {failureNote}
       </div>
     );
   }
@@ -788,7 +814,7 @@ function MessageBubble({ message }: { message: ChatMessage }) {
     const url = message.url;
     return (
       <div
-        className={`message link-message ${message.direction} openable`}
+        className={`message link-message ${message.direction} openable${failed ? " failed" : ""}`}
         title={`Open ${url}`}
         role="button"
         tabIndex={0}
@@ -802,11 +828,17 @@ function MessageBubble({ message }: { message: ChatMessage }) {
       >
         <span className="file-icon"><LinkIcon size={16} /></span>
         <span className="link-text">{url}</span>
+        {failureNote}
       </div>
     );
   }
 
-  return <p className={`message ${message.direction}`}>{message.text}</p>;
+  return (
+    <p className={`message ${message.direction}${failed ? " failed" : ""}`}>
+      <span>{message.text}</span>
+      {failureNote}
+    </p>
+  );
 }
 
 function ChatPanel({
@@ -829,6 +861,7 @@ function ChatPanel({
   const typingSent = useRef(false);
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const peerId = peer?.id ?? null;
+  const peerOffline = peer?.status === "offline";
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -907,6 +940,12 @@ function ChatPanel({
         </div>
         <button className="icon-button" title="Close chat" onClick={onClose}><X size={18} /></button>
       </header>
+      {peerOffline && (
+        <div className="offline-notice" role="status">
+          <WifiOff size={16} />
+          <span>{peer.name} appears offline. Wake that PC and keep SimplePass running before retrying.</span>
+        </div>
+      )}
       <div className="message-list">
         {messages.map((message) => (
           <MessageBubble key={message.id} message={message} />

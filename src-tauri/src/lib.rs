@@ -196,10 +196,18 @@ struct ChatMessage {
     file_path: Option<String>,
     #[serde(default)]
     url: Option<String>,
+    #[serde(default = "default_delivery_state")]
+    delivery_state: String,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 fn default_message_kind() -> String {
     "text".to_string()
+}
+
+fn default_delivery_state() -> String {
+    "delivered".to_string()
 }
 
 fn make_chat_message(peer_id: String, direction: &str, kind: &str, text: String) -> ChatMessage {
@@ -214,7 +222,37 @@ fn make_chat_message(peer_id: String, direction: &str, kind: &str, text: String)
         file_size: None,
         file_path: None,
         url: None,
+        delivery_state: default_delivery_state(),
+        error: None,
     }
+}
+
+fn delivery_failure_text(peer_name: &str) -> String {
+    format!(
+        "Not delivered. {peer_name} appears offline, asleep, shut down, or SimplePass is not running."
+    )
+}
+
+fn mark_message_failed(message: &mut ChatMessage, error: String) {
+    message.delivery_state = "failed".to_string();
+    message.error = Some(error);
+}
+
+fn record_failed_file_message(
+    app: &AppHandle,
+    state: &State<AppState>,
+    peer_id: String,
+    file_name: String,
+    total_size: u64,
+    record_path: Option<&str>,
+    error: String,
+) -> AppResult<()> {
+    let mut message = make_chat_message(peer_id, "sent", "file", file_name.clone());
+    message.file_name = Some(file_name);
+    message.file_size = Some(total_size);
+    message.file_path = record_path.map(|path| path.to_string());
+    mark_message_failed(&mut message, error);
+    record_chat_message(app, state, message)
 }
 
 fn record_chat_message(
@@ -384,6 +422,7 @@ struct PeerConn {
     stream: TcpStream,
     secret: String,
     failed: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -687,14 +726,19 @@ fn send_message(
     ensure_paired(&state, &peer_id)?;
     let peer = get_peer(&state, &peer_id)?;
     let local_id = existing_device_id(&state)?;
-    send_wire(
+    let send_result = send_wire(
         &peer,
         WireMessage::Chat {
             peer_id: local_id,
             text: text.clone(),
         },
-    )?;
-    let message = make_chat_message(peer_id, "sent", "text", text);
+    );
+    let mut message = make_chat_message(peer_id.clone(), "sent", "text", text);
+    if send_result.is_err() {
+        let error = delivery_failure_text(&peer.name);
+        mark_message_failed(&mut message, error);
+        let _ = mark_peer_offline(&app, &state, &peer_id);
+    }
     record_chat_message(&app, &state, message)
 }
 
@@ -780,9 +824,16 @@ fn send_link(
                 message.url = Some(url.clone());
                 let _ = record_chat_message(&app, &state, message);
             }
-            Err(err) => {
+            Err(_) => {
+                let error = delivery_failure_text(&transfer.peer_name);
                 transfer.state = "failed".to_string();
-                transfer.error = Some(err);
+                transfer.error = Some(error.clone());
+                let mut message =
+                    make_chat_message(transfer.peer_id.clone(), "sent", "link", url.clone());
+                message.url = Some(url.clone());
+                mark_message_failed(&mut message, error);
+                let _ = record_chat_message(&app, &state, message);
+                let _ = mark_peer_offline(&app, &state, &transfer.peer_id);
             }
         }
         emit_transfer(&app, transfer.clone())?;
@@ -921,7 +972,8 @@ fn send_one_file(
                         total_size: total,
                     },
                 );
-                let failed = started.is_err();
+                let error = started.err().map(|_| delivery_failure_text(&peer.name));
+                let failed = error.is_some();
                 let _ = emit_transfer(
                     app,
                     file_row(
@@ -930,29 +982,43 @@ fn send_one_file(
                         &file_name,
                         0,
                         if failed { "failed" } else { "sending" },
-                        started.err(),
+                        error.clone(),
                     ),
                 );
+                if failed {
+                    let _ = mark_peer_offline(app, &state, &peer.id);
+                }
                 conns.push(PeerConn {
                     peer_id: peer.id.clone(),
                     peer_name: peer.name.clone(),
                     stream,
                     secret: secret.clone(),
                     failed,
+                    error,
                 });
             }
-            Err(err) => {
-                let _ = emit_transfer(
-                    app,
-                    file_row(
-                        &transfer_id,
-                        peer,
-                        &file_name,
-                        0,
-                        "failed",
-                        Some(err.to_string()),
-                    ),
+            Err(_) => {
+                let error = delivery_failure_text(&peer.name);
+                let row = file_row(
+                    &transfer_id,
+                    peer,
+                    &file_name,
+                    0,
+                    "failed",
+                    Some(error.clone()),
                 );
+                persist_transfer_row(&state, row.clone());
+                let _ = emit_transfer(app, row);
+                let _ = record_failed_file_message(
+                    app,
+                    &state,
+                    peer.id.clone(),
+                    file_name.clone(),
+                    total,
+                    record_path,
+                    error,
+                );
+                let _ = mark_peer_offline(app, &state, &peer.id);
             }
         }
     }
@@ -962,40 +1028,59 @@ fn send_one_file(
     let mut buffer = vec![0_u8; FILE_CHUNK_SIZE];
     let mut cancelled = false;
     let mut read_failed = false;
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            cancelled = true;
-            break;
-        }
-        let read = match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => {
-                read_failed = true;
+    if conns.iter().any(|conn| !conn.failed) {
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                cancelled = true;
                 break;
             }
-        };
-        let data = BASE64.encode(&buffer[..read]);
-        sent += read as u64;
-        let progress = (((sent as f64) / (total.max(1) as f64)) * 100.0)
-            .round()
-            .min(100.0) as u8;
-        for conn in conns.iter_mut() {
-            if conn.failed {
-                continue;
+            let read = match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => {
+                    read_failed = true;
+                    break;
+                }
+            };
+            let data = BASE64.encode(&buffer[..read]);
+            sent += read as u64;
+            let progress = (((sent as f64) / (total.max(1) as f64)) * 100.0)
+                .round()
+                .min(100.0) as u8;
+            for conn in conns.iter_mut() {
+                if conn.failed {
+                    continue;
+                }
+                let result = write_encrypted_line(
+                    &mut conn.stream,
+                    local_id,
+                    &conn.secret,
+                    &WireMessage::FileChunk {
+                        peer_id: local_id.to_string(),
+                        transfer_id: transfer_id.clone(),
+                        data: data.clone(),
+                    },
+                );
+                if result.is_err() {
+                    conn.failed = true;
+                    let error = delivery_failure_text(&conn.peer_name);
+                    conn.error = Some(error.clone());
+                    let _ = emit_transfer(
+                        app,
+                        peer_row(
+                            &transfer_id,
+                            &conn.peer_id,
+                            &conn.peer_name,
+                            &file_name,
+                            progress,
+                            "failed",
+                            Some(error),
+                        ),
+                    );
+                    let _ = mark_peer_offline(app, &state, &conn.peer_id);
+                }
             }
-            let result = write_encrypted_line(
-                &mut conn.stream,
-                local_id,
-                &conn.secret,
-                &WireMessage::FileChunk {
-                    peer_id: local_id.to_string(),
-                    transfer_id: transfer_id.clone(),
-                    data: data.clone(),
-                },
-            );
-            if let Err(err) = result {
-                conn.failed = true;
+            for conn in conns.iter().filter(|conn| !conn.failed) {
                 let _ = emit_transfer(
                     app,
                     peer_row(
@@ -1004,32 +1089,18 @@ fn send_one_file(
                         &conn.peer_name,
                         &file_name,
                         progress,
-                        "failed",
-                        Some(err),
+                        "sending",
+                        None,
                     ),
                 );
             }
-        }
-        for conn in conns.iter().filter(|conn| !conn.failed) {
-            let _ = emit_transfer(
-                app,
-                peer_row(
-                    &transfer_id,
-                    &conn.peer_id,
-                    &conn.peer_name,
-                    &file_name,
-                    progress,
-                    "sending",
-                    None,
-                ),
-            );
         }
     }
 
     // Send the end marker only on a clean finish.
     if !cancelled && !read_failed {
         for conn in conns.iter_mut().filter(|conn| !conn.failed) {
-            let _ = write_encrypted_line(
+            let ended = write_encrypted_line(
                 &mut conn.stream,
                 local_id,
                 &conn.secret,
@@ -1037,8 +1108,14 @@ fn send_one_file(
                     peer_id: local_id.to_string(),
                     transfer_id: transfer_id.clone(),
                 },
-            );
-            let _ = conn.stream.flush();
+            )
+            .and_then(|_| conn.stream.flush().map_err(|err| err.to_string()));
+            if ended.is_err() {
+                conn.failed = true;
+                let error = delivery_failure_text(&conn.peer_name);
+                conn.error = Some(error);
+                let _ = mark_peer_offline(app, &state, &conn.peer_id);
+            }
         }
     } else if cancelled {
         // Tell each receiver to discard the partial file it has been writing.
@@ -1067,7 +1144,12 @@ fn send_one_file(
         } else if read_failed {
             ("failed", Some("Could not read the file.".to_string()))
         } else if conn.failed {
-            ("failed", None)
+            (
+                "failed",
+                conn.error
+                    .clone()
+                    .or_else(|| Some(delivery_failure_text(&conn.peer_name))),
+            )
         } else {
             ("complete", None)
         };
@@ -1078,13 +1160,9 @@ fn send_one_file(
             &file_name,
             100,
             terminal,
-            error,
+            error.clone(),
         );
-        if let Ok(mut persisted) = state.inner.lock() {
-            persisted.transfers.push(row.clone());
-            trim_transfers(&mut persisted);
-            let _ = save_state(&state.path, &persisted);
-        }
+        persist_transfer_row(&state, row.clone());
         let _ = emit_transfer(app, row);
 
         if !cancelled && !read_failed && !conn.failed {
@@ -1094,6 +1172,16 @@ fn send_one_file(
             message.file_size = Some(total);
             message.file_path = record_path.map(|p| p.to_string());
             let _ = record_chat_message(app, &state, message);
+        } else if terminal == "failed" {
+            let _ = record_failed_file_message(
+                app,
+                &state,
+                conn.peer_id.clone(),
+                file_name.clone(),
+                total,
+                record_path,
+                error.unwrap_or_else(|| "Not delivered.".to_string()),
+            );
         }
     }
 }
@@ -1434,8 +1522,10 @@ pub fn run() {
     // WebView2 user-data dir, leaving the new window stuck on "Starting SimplePass…".
     #[cfg(desktop)]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            reveal_main_window(app);
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if !argv.iter().any(|arg| is_background_launch_arg(arg)) {
+                reveal_main_window(app);
+            }
         }));
     }
     builder
@@ -1452,6 +1542,7 @@ pub fn run() {
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
             let path = app_data_file(app.handle())?;
             let persisted = load_state(&path);
+            let launch_silently = is_background_launch();
             let _ = configure_autostart(app.handle(), persisted.setup.start_at_login);
             let widget = (
                 persisted.setup.floating_icon,
@@ -1470,6 +1561,9 @@ pub fn run() {
                 widget_active: AtomicBool::new(false),
             });
             build_tray(app.handle())?;
+            if !launch_silently {
+                reveal_main_window(app.handle());
+            }
             if widget.0 {
                 // Centre on launch too (per request), with the same radar pulse.
                 let _ = open_widget_window(app.handle(), widget.1, widget.2, true);
@@ -1885,6 +1979,26 @@ fn mark_stale_peers_offline(app: &AppHandle, state: &State<AppState>, now: i64) 
     Ok(())
 }
 
+fn mark_peer_offline(app: &AppHandle, state: &State<AppState>, peer_id: &str) -> AppResult<()> {
+    let maybe_peers = {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        let changed = apply_peer_offline_status(&mut persisted, peer_id);
+        if changed {
+            let peers = persisted.peers.clone();
+            save_state(&state.path, &persisted)?;
+            Some(peers)
+        } else {
+            None
+        }
+    };
+
+    if let Some(peers) = maybe_peers {
+        app.emit("peers-changed", peers)
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
 /// Bound an untrusted, peer-supplied device name: trim, cap to
 /// `MAX_DEVICE_NAME_LEN` characters (by `char`, not bytes, so multi-byte names are
 /// never split mid-codepoint), and substitute a placeholder when empty. Prevents a
@@ -1960,6 +2074,17 @@ fn apply_stale_peer_status(state: &mut PersistedState, now: i64) -> bool {
         }
     }
     changed
+}
+
+fn apply_peer_offline_status(state: &mut PersistedState, peer_id: &str) -> bool {
+    let Some(peer) = state.peers.iter_mut().find(|peer| peer.id == peer_id) else {
+        return false;
+    };
+    if peer.status == "offline" {
+        return false;
+    }
+    peer.status = "offline".to_string();
+    true
 }
 
 fn upsert_discovered_peer(
@@ -2367,6 +2492,22 @@ fn ensure_paired(state: &State<AppState>, peer_id: &str) -> AppResult<()> {
 fn emit_transfer(app: &AppHandle, transfer: TransferProgress) -> AppResult<()> {
     app.emit("transfer-progress", transfer)
         .map_err(|err| err.to_string())
+}
+
+fn persist_transfer_row(state: &State<AppState>, row: TransferProgress) {
+    if let Ok(mut persisted) = state.inner.lock() {
+        persisted.transfers.push(row);
+        trim_transfers(&mut persisted);
+        let _ = save_state(&state.path, &persisted);
+    }
+}
+
+fn is_background_launch_arg(arg: &str) -> bool {
+    arg == "--background"
+}
+
+fn is_background_launch() -> bool {
+    std::env::args().any(|arg| is_background_launch_arg(&arg))
 }
 
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -3346,6 +3487,43 @@ mod tests {
 
         assert!(changed);
         assert_eq!(state.peers[0].status, "offline");
+    }
+
+    #[test]
+    fn old_messages_default_to_delivered() {
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "m1",
+            "peerId": "peer-1",
+            "direction": "sent",
+            "text": "hello",
+            "createdAt": 1
+        }))
+        .expect("legacy message");
+
+        assert_eq!(message.delivery_state, "delivered");
+        assert!(message.error.is_none());
+    }
+
+    #[test]
+    fn explicit_send_failure_marks_peer_offline() {
+        let mut state = PersistedState::default();
+        state.peers.push(PeerDevice {
+            id: "peer-1".to_string(),
+            name: "Peer".to_string(),
+            host: "192.168.1.10".to_string(),
+            port: TRANSPORT_PORT,
+            public_key: None,
+            os: "windows".to_string(),
+            status: "online".to_string(),
+            trust_state: "paired".to_string(),
+            shared_secret: Some(new_shared_secret()),
+            avatar: None,
+            last_seen: 1_000,
+        });
+
+        assert!(apply_peer_offline_status(&mut state, "peer-1"));
+        assert_eq!(state.peers[0].status, "offline");
+        assert!(!apply_peer_offline_status(&mut state, "peer-1"));
     }
 
     fn peer_at(id: &str, host: &str, status: &str) -> PeerDevice {

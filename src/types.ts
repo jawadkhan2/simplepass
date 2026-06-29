@@ -37,6 +37,8 @@ export interface ChatMessage {
   fileSize?: number | null;
   filePath?: string | null;
   url?: string | null;
+  deliveryState?: "delivered" | "failed";
+  error?: string | null;
 }
 
 export interface TypingSignal {
