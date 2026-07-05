@@ -436,6 +436,10 @@ struct IncomingFile {
     received_size: u64,
     peer_name: String,
     file_name: String,
+    /// Last integer percent pushed to the UI. Chunks that don't advance the
+    /// percent skip the emit, so a large transfer can't flood the webview IPC
+    /// with one event per 64 KiB chunk.
+    last_progress: i32,
 }
 
 #[tauri::command]
@@ -519,28 +523,32 @@ fn recent_peer(state: State<AppState>) -> AppResult<Option<PeerDevice>> {
 
 #[tauri::command]
 fn pair_peer(app: AppHandle, state: State<AppState>, peer_id: String) -> AppResult<()> {
-    let (peers, peer) = {
+    let (peers, peer, prior_trust) = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
         let peer = persisted
             .peers
             .iter_mut()
             .find(|peer| peer.id == peer_id)
             .ok_or_else(|| "Peer not found.".to_string())?;
+        // Remember the prior trust so a send failure reverts to exactly it, not a
+        // hardcoded "unpaired" — otherwise re-pairing an already-paired peer that
+        // hits a transient send error would silently downgrade it to unpaired.
+        let prior_trust = peer.trust_state.clone();
         peer.trust_state = "pending".to_string();
         peer.last_seen = now_ms();
         let peer_clone = peer.clone();
         let peers = persisted.peers.clone();
         save_state(&state.path, &persisted)?;
-        (peers, peer_clone)
+        (peers, peer_clone, prior_trust)
     };
     let packet = local_discovery_packet(&state)?;
     if let Err(err) = send_plain_wire(&peer, WireMessage::PairRequest { device: packet }) {
-        // The request never left; don't strand the tile on "Pending". Revert and
-        // surface the failure so the user can retry.
+        // The request never left; don't strand the tile on "Pending". Revert to the
+        // prior trust and surface the failure so the user can retry.
         let reverted = {
             let mut persisted = state.inner.lock().map_err(lock_err)?;
             if let Some(peer) = persisted.peers.iter_mut().find(|peer| peer.id == peer_id) {
-                peer.trust_state = "unpaired".to_string();
+                peer.trust_state = prior_trust;
             }
             let reverted = persisted.peers.clone();
             save_state(&state.path, &persisted)?;
@@ -1028,6 +1036,10 @@ fn send_one_file(
     let mut buffer = vec![0_u8; FILE_CHUNK_SIZE];
     let mut cancelled = false;
     let mut read_failed = false;
+    // Only push a progress event to the UI when the integer percent actually
+    // changes. A 64 KiB chunk size means a multi-GiB file would otherwise emit
+    // hundreds of thousands of identical-percent events, flooding the webview IPC.
+    let mut last_emitted: i32 = -1;
     if conns.iter().any(|conn| !conn.failed) {
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -1080,19 +1092,22 @@ fn send_one_file(
                     let _ = mark_peer_offline(app, &state, &conn.peer_id);
                 }
             }
-            for conn in conns.iter().filter(|conn| !conn.failed) {
-                let _ = emit_transfer(
-                    app,
-                    peer_row(
-                        &transfer_id,
-                        &conn.peer_id,
-                        &conn.peer_name,
-                        &file_name,
-                        progress,
-                        "sending",
-                        None,
-                    ),
-                );
+            if progress as i32 != last_emitted {
+                last_emitted = progress as i32;
+                for conn in conns.iter().filter(|conn| !conn.failed) {
+                    let _ = emit_transfer(
+                        app,
+                        peer_row(
+                            &transfer_id,
+                            &conn.peer_id,
+                            &conn.peer_name,
+                            &file_name,
+                            progress,
+                            "sending",
+                            None,
+                        ),
+                    );
+                }
             }
         }
     }
@@ -1686,9 +1701,14 @@ fn handle_stream(app: AppHandle, stream: TcpStream) -> AppResult<()> {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
     let mut reader = BufReader::new(stream);
+    // transfer_ids for incoming files opened on *this* connection. If the
+    // connection ends before their FileEnd/FileCancel (peer dropped, timed out, or
+    // an error broke the loop), each leaves an open handle plus a partial file in
+    // Downloads. We reclaim them below so an abandoned transfer can't leak forever.
+    let mut owned_transfers: Vec<String> = Vec::new();
     // A single connection may carry multiple newline-delimited envelopes (notably
     // for chunked file transfers). Processing them on one thread keeps chunks in order.
-    loop {
+    let result: AppResult<()> = (|| loop {
         let mut body = String::new();
         // Cap each line so a peer can't OOM us with one endless line. A line that
         // hits the cap is almost certainly hostile/garbage; drop the connection.
@@ -1697,10 +1717,10 @@ fn handle_stream(app: AppHandle, stream: TcpStream) -> AppResult<()> {
             .read_line(&mut body)
             .map_err(|err| err.to_string())?;
         if read == 0 {
-            break;
+            break Ok(());
         }
         if read as u64 >= MAX_LINE_BYTES && !body.ends_with('\n') {
-            return Err("Incoming message exceeded the size limit.".to_string());
+            break Err("Incoming message exceeded the size limit.".to_string());
         }
         let trimmed = body.trim();
         if trimmed.is_empty() {
@@ -1710,9 +1730,34 @@ fn handle_stream(app: AppHandle, stream: TcpStream) -> AppResult<()> {
         let envelope: TransportEnvelope =
             serde_json::from_str(trimmed).map_err(|err| err.to_string())?;
         let message = decrypt_envelope(&state, envelope)?;
-        handle_message(&app, &state, message, remote_addr)?;
+        handle_message(&app, &state, message, remote_addr, &mut owned_transfers)?;
+    })();
+
+    // Reclaim any transfer still in-progress when the connection ended.
+    if !owned_transfers.is_empty() {
+        let state = app.state::<AppState>();
+        for transfer_id in &owned_transfers {
+            abort_incoming_transfer(&state, transfer_id);
+        }
     }
-    Ok(())
+    result
+}
+
+/// Drop an in-progress incoming transfer: remove its map entry and delete the
+/// partial file from disk (best-effort). Used to reclaim a transfer abandoned when
+/// its connection dropped mid-stream, so it can't leak a file handle or disk space.
+fn abort_incoming_transfer(state: &State<AppState>, transfer_id: &str) {
+    let entry = {
+        let Ok(mut incoming) = state.incoming_files.lock() else {
+            return;
+        };
+        incoming.remove(transfer_id)
+    };
+    if let Some(entry_arc) = entry {
+        if let Ok(entry) = entry_arc.lock() {
+            let _ = fs::remove_file(&entry.path);
+        }
+    }
 }
 
 fn handle_message(
@@ -1720,6 +1765,7 @@ fn handle_message(
     state: &State<AppState>,
     message: WireMessage,
     remote_addr: Option<SocketAddr>,
+    owned_transfers: &mut Vec<String>,
 ) -> AppResult<()> {
     match message {
         WireMessage::PairRequest { device } => {
@@ -1796,7 +1842,10 @@ fn handle_message(
             file_name,
             total_size,
         } => {
-            receive_file_start(app, state, peer_id, transfer_id, file_name, total_size)?;
+            receive_file_start(app, state, peer_id, transfer_id.clone(), file_name, total_size)?;
+            // Now owned by this connection; reclaimed on disconnect if it never
+            // reaches FileEnd/FileCancel.
+            owned_transfers.push(transfer_id);
         }
         WireMessage::FileChunk {
             peer_id,
@@ -1809,13 +1858,15 @@ fn handle_message(
             peer_id,
             transfer_id,
         } => {
-            receive_file_end(app, state, peer_id, transfer_id)?;
+            receive_file_end(app, state, peer_id, transfer_id.clone())?;
+            owned_transfers.retain(|id| id != &transfer_id);
         }
         WireMessage::FileCancel {
             peer_id,
             transfer_id,
         } => {
-            receive_file_cancel(app, state, peer_id, transfer_id)?;
+            receive_file_cancel(app, state, peer_id, transfer_id.clone())?;
+            owned_transfers.retain(|id| id != &transfer_id);
         }
     }
     Ok(())
@@ -1916,6 +1967,12 @@ fn upsert_peer_from_addr(
     }
     let peers = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
+        let before_len = persisted.peers.len();
+        // Whether anything the UI or disk cares about changed. A bare `last_seen`
+        // refresh (the common case — each peer broadcasts every ~2.5 s) is *not*
+        // material: persisting and re-emitting on every packet churned state.json
+        // and forced a peer-grid re-render several times a second per peer.
+        let mut material = false;
         match persisted
             .peers
             .iter_mut()
@@ -1924,6 +1981,15 @@ fn upsert_peer_from_addr(
             Some(peer) => {
                 if !can_replace_peer_public_key(peer, &packet.public_key) {
                     return Ok(());
+                }
+                if peer.name != packet.device_name
+                    || peer.host != host
+                    || peer.port != packet.port
+                    || peer.public_key.as_deref() != Some(packet.public_key.as_str())
+                    || peer.os != packet.os
+                    || peer.status != "online"
+                {
+                    material = true;
                 }
                 peer.name = packet.device_name.clone();
                 peer.host = host.clone();
@@ -1935,22 +2001,31 @@ fn upsert_peer_from_addr(
                 peer.status = "online".to_string();
                 peer.last_seen = now_ms();
             }
-            None => persisted.peers.push(PeerDevice {
-                id: packet.device_id.clone(),
-                name: packet.device_name.clone(),
-                host: host.clone(),
-                port: packet.port,
-                public_key: Some(packet.public_key.clone()),
-                os: packet.os.clone(),
-                status: "online".to_string(),
-                trust_state: "unpaired".to_string(),
-                shared_secret: None,
-                avatar: None,
-                last_seen: now_ms(),
-            }),
+            None => {
+                persisted.peers.push(PeerDevice {
+                    id: packet.device_id.clone(),
+                    name: packet.device_name.clone(),
+                    host: host.clone(),
+                    port: packet.port,
+                    public_key: Some(packet.public_key.clone()),
+                    os: packet.os.clone(),
+                    status: "online".to_string(),
+                    trust_state: "unpaired".to_string(),
+                    shared_secret: None,
+                    avatar: None,
+                    last_seen: now_ms(),
+                });
+                material = true;
+            }
         }
-        prune_offline_host_duplicates(&mut persisted, &packet.device_id, &host);
+        material |= prune_offline_host_duplicates(&mut persisted, &packet.device_id, &host);
         enforce_peer_cap(&mut persisted);
+        material |= persisted.peers.len() != before_len;
+        if !material {
+            // Only `last_seen` moved; keep it in memory (offline detection reads the
+            // in-memory list) but skip the disk write and the UI event.
+            return Ok(());
+        }
         let peers = persisted.peers.clone();
         save_state(&state.path, &persisted)?;
         peers
@@ -2312,12 +2387,12 @@ fn decrypt_envelope(
             nonce,
             body,
         } => {
-            let peer = get_peer(state, &peer_id)?;
-            let secret = peer
-                .shared_secret
-                .as_deref()
-                .ok_or_else(|| format!("{} does not have a shared secret yet.", peer.name))?;
-            let key = decode_secret(secret)?;
+            // Fetch only the shared secret under the lock — never clone the whole
+            // PeerDevice here. This runs for every encrypted envelope (i.e. every
+            // 64 KiB file chunk), and a peer's avatar can be up to 256 KiB; cloning
+            // it per chunk was hundreds of thousands of pointless allocations.
+            let secret = peer_shared_secret(state, &peer_id)?;
+            let key = decode_secret(&secret)?;
             let nonce = decode_nonce(&nonce)?;
             let body = BASE64.decode(body).map_err(|err| err.to_string())?;
             let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|err| err.to_string())?;
@@ -2441,6 +2516,21 @@ fn get_peer(state: &State<AppState>, peer_id: &str) -> AppResult<PeerDevice> {
         .find(|peer| peer.id == peer_id)
         .cloned()
         .ok_or_else(|| "Peer not found.".to_string())
+}
+
+/// Fetch just a peer's shared secret (base64) without cloning the whole
+/// `PeerDevice`. Hot path: called for every encrypted envelope, including every
+/// file chunk, where cloning the peer (avatar included) would be wasteful.
+fn peer_shared_secret(state: &State<AppState>, peer_id: &str) -> AppResult<String> {
+    let persisted = state.inner.lock().map_err(lock_err)?;
+    let peer = persisted
+        .peers
+        .iter()
+        .find(|peer| peer.id == peer_id)
+        .ok_or_else(|| "Peer not found.".to_string())?;
+    peer.shared_secret
+        .clone()
+        .ok_or_else(|| format!("{} does not have a shared secret yet.", peer.name))
 }
 
 fn make_transfers(
@@ -2982,6 +3072,13 @@ fn receive_file_start(
 
     {
         let mut incoming = state.incoming_files.lock().map_err(lock_err)?;
+        // transfer_id is peer-controlled. A second FileStart reusing a live id
+        // would orphan the first handle and leak its partial file, so reject it.
+        if incoming.contains_key(&transfer_id) {
+            drop(incoming);
+            let _ = fs::remove_file(&destination);
+            return Err("A transfer with this id is already in progress.".to_string());
+        }
         incoming.insert(
             transfer_id.clone(),
             Arc::new(Mutex::new(IncomingFile {
@@ -2992,6 +3089,7 @@ fn receive_file_start(
                 received_size: 0,
                 peer_name: peer_name.clone(),
                 file_name: file_name.clone(),
+                last_progress: -1,
             })),
         );
     }
@@ -3028,7 +3126,8 @@ fn receive_file_chunk(
     }
     .ok_or_else(|| "Received a chunk for an unknown transfer.".to_string())?;
 
-    let outcome: Result<(u8, String, String), PathBuf> = {
+    // `bool` = whether the integer percent advanced (and so is worth emitting).
+    let outcome: Result<(u8, String, String, bool), PathBuf> = {
         let mut entry = entry_arc.lock().map_err(lock_err)?;
         if entry.peer_id != peer_id.as_str() {
             return Err("Received a chunk for a different peer's transfer.".to_string());
@@ -3048,11 +3147,22 @@ fn receive_file_chunk(
                 * 100.0)
                 .round()
                 .min(100.0) as u8;
-            Ok((progress, entry.peer_name.clone(), entry.file_name.clone()))
+            // Skip the emit when the percent hasn't moved, so a 64 KiB chunk stream
+            // can't flood the UI with one event per chunk (see `last_progress`).
+            let advanced = progress as i32 != entry.last_progress;
+            if advanced {
+                entry.last_progress = progress as i32;
+            }
+            Ok((
+                progress,
+                entry.peer_name.clone(),
+                entry.file_name.clone(),
+                advanced,
+            ))
         }
     };
 
-    let (progress, peer_name, file_name) = match outcome {
+    let (progress, peer_name, file_name, advanced) = match outcome {
         Ok(values) => values,
         Err(path) => {
             let mut incoming = state.incoming_files.lock().map_err(lock_err)?;
@@ -3062,6 +3172,10 @@ fn receive_file_chunk(
             return Err("Incoming file exceeded its declared size.".to_string());
         }
     };
+
+    if !advanced {
+        return Ok(());
+    }
 
     emit_transfer(
         app,
@@ -3103,15 +3217,44 @@ fn receive_file_end(
     }
     // We hold the only remaining `Arc`; copy out what we need, then drop the guard
     // (and with it the append handle, flushing/closing the file) before continuing.
-    let (path, file_name, expected_size, peer_name) = {
+    let (path, file_name, expected_size, received_size, peer_name) = {
         let entry = entry_arc.lock().map_err(lock_err)?;
         (
             entry.path.clone(),
             entry.file_name.clone(),
             entry.expected_size,
+            entry.received_size,
             entry.peer_name.clone(),
         )
     };
+
+    // Reject a short transfer: the sender declared `expected_size` in FileStart but
+    // ended before delivering it (dropped connection, or a peer lying to make a
+    // truncated/empty file look complete). Discard the partial file and report it
+    // failed rather than recording a bogus "complete" chat entry.
+    if received_size != expected_size {
+        let _ = fs::remove_file(&path);
+        let error = "The transfer ended before all data arrived.".to_string();
+        let mut message =
+            make_chat_message(peer_id.clone(), "received", "file", file_name.clone());
+        message.file_name = Some(file_name.clone());
+        message.file_size = Some(expected_size);
+        mark_message_failed(&mut message, error.clone());
+        let _ = record_chat_message(app, state, message);
+        return emit_transfer(
+            app,
+            TransferProgress {
+                id: transfer_id,
+                peer_id,
+                peer_name,
+                label: file_name,
+                kind: "file".to_string(),
+                progress: 0,
+                state: "failed".to_string(),
+                error: Some(error),
+            },
+        );
+    }
 
     let mut message = make_chat_message(peer_id.clone(), "received", "file", file_name.clone());
     message.file_name = Some(file_name.clone());
