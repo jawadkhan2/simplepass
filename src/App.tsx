@@ -30,10 +30,13 @@ import {
 import { api, events } from "./tauri";
 import { applyPendingUpdate, checkForUpdate, startAutoUpdate } from "./updater";
 import type { AvailableUpdate } from "./updater";
-import type { ChatMessage, PeerDevice, SetupState, TransferProgress } from "./types";
+import type { ChatMessage, PeerDevice, PeerStatus, SetupState, TransferProgress } from "./types";
 
 const TRANSFER_LIMIT = 8;
 const looksLikeUrl = (value: string) => /^https?:\/\/\S+$/i.test(value.trim());
+
+// Human-facing labels for the raw peer status enum (never show `online`/`offline`).
+const STATUS_LABEL: Record<PeerStatus, string> = { online: "Online", offline: "Offline" };
 
 // One-line preview of an incoming message for a toast body.
 function notificationBody(message: ChatMessage): string {
@@ -57,35 +60,12 @@ async function notifyIfHidden(message: ChatMessage): Promise<void> {
   }
 }
 
-function AppIcon({ size = 18 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 48 48" fill="none" aria-hidden="true">
-      <defs>
-        <linearGradient id="tbIcon" x1="4" y1="4" x2="44" y2="44" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor="#e8a07e" />
-          <stop offset="1" stopColor="#c8643c" />
-        </linearGradient>
-      </defs>
-      <rect x="3" y="3" width="42" height="42" rx="11" fill="url(#tbIcon)" />
-      <path
-        d="M14 24h4l3-7 4 14 3-7h6"
-        stroke="#ffffff"
-        strokeWidth="2.6"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <circle cx="10" cy="24" r="4.2" fill="#ffe6d6" />
-      <circle cx="38" cy="24" r="4.2" fill="#ffffff" />
-    </svg>
-  );
-}
-
 function TitleBar() {
   const win = getCurrentWindow();
   return (
     <div className="titlebar">
       <div className="titlebar-drag" data-tauri-drag-region>
-        <span className="titlebar-icon"><AppIcon size={18} /></span>
+        <span className="titlebar-icon"><BrandMark size={18} /></span>
         <span className="titlebar-title">SimplePass</span>
       </div>
       <div className="titlebar-controls">
@@ -413,6 +393,25 @@ export default function App() {
     void api.listMessages(chatPeerId).then(setMessages);
   }, [chatPeerId]);
 
+  // Escape closes the topmost surface: settings → pairing prompt → open chat.
+  // Escaping a pairing prompt denies it (the safe "cancel").
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      if (settingsOpen) {
+        setSettingsOpen(false);
+      } else if (pairingRequest) {
+        api.denyPairing(pairingRequest.id)
+          .then(() => setPairingRequest(null))
+          .catch((err) => setError(String(err)));
+      } else if (chatPeerId) {
+        setChatPeerId(null);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [settingsOpen, pairingRequest, chatPeerId]);
+
   if (!setup) {
     return (
       <WindowFrame>
@@ -487,8 +486,8 @@ export default function App() {
         <div className="brand">
           <BrandMark />
           <div>
-            <h1>Simple<span className="brand-accent">Pass</span></h1>
-            <p>{setup.deviceName}</p>
+            <h1>{setup.deviceName}</h1>
+            <p>This computer</p>
           </div>
         </div>
         <div className="topbar-right">
@@ -505,7 +504,14 @@ export default function App() {
         <div className="devices-panel">
           <div className="section-heading">
             <h2>Nearby Computers</h2>
-            <span>{peers.filter((peer) => peer.status === "online").length} online</span>
+            {selectedIds.length > 0 ? (
+              <span className="selection-hint">
+                {selectedIds.length} selected · drop files to send to all
+                <button className="clear-selection" onClick={() => setSelectedIds([])}>Clear</button>
+              </span>
+            ) : (
+              <span>{peers.filter((peer) => peer.status === "online").length} online</span>
+            )}
             <button
               className="rescan-button"
               title="Rescan the network"
@@ -712,7 +718,7 @@ function DeviceTile(props: {
       </div>
       <h3>{peer.name}</h3>
       <p>{peer.os || peer.host}{peer.host ? ` · ${peer.host}` : ""}</p>
-      <span className={`status-dot ${peer.status}`}>{peer.status}</span>
+      <span className={`status-dot ${peer.status}`}>{STATUS_LABEL[peer.status]}</span>
       <div className="tile-actions">
         {paired ? (
           <>
@@ -749,7 +755,12 @@ function DeviceTile(props: {
 
 function PairingModal({ peer, onAccept, onDeny }: { peer: PeerDevice; onAccept: () => void; onDeny: () => void }) {
   return (
-    <div className="modal-backdrop">
+    <div
+      className="modal-backdrop"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onDeny();
+      }}
+    >
       <section className="pairing-panel">
         <div className="device-avatar">
           <Avatar src={peer.avatar} size={34} />
@@ -935,7 +946,7 @@ function ChatPanel({
           <span className="chat-avatar"><Avatar src={peer.avatar} size={22} /></span>
           <div>
             <h2>{peer.name}</h2>
-            <span>{peerTyping ? "typing…" : peer.status}</span>
+            <span>{peerTyping ? "typing…" : STATUS_LABEL[peer.status]}</span>
           </div>
         </div>
         <button className="icon-button" title="Close chat" onClick={onClose}><X size={18} /></button>
@@ -960,7 +971,7 @@ function ChatPanel({
         <div ref={bottomRef} />
       </div>
       <form className="composer" onSubmit={submit}>
-        <input value={text} onChange={onChange} placeholder="Message" />
+        <input value={text} onChange={onChange} placeholder="Message or paste a link" />
         <button type="submit">Send</button>
       </form>
     </aside>
@@ -1022,10 +1033,28 @@ function SettingsPanel(props: {
     }
   }
 
-  async function save() {
-    const setup = await api.saveSetup(deviceName.trim(), startAtLogin);
-    props.onSetup(setup);
-    props.onClose();
+  // Device name persists on blur, matching the instant-apply model of every
+  // other control in this panel (so there's no "was that saved?" ambiguity).
+  async function saveName() {
+    const name = deviceName.trim();
+    if (!name || name === props.setup.deviceName) return;
+    try {
+      const updated = await api.saveSetup(name, startAtLogin);
+      props.onSetup(updated);
+    } catch (err) {
+      props.onError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  async function toggleStartAtLogin(enabled: boolean) {
+    setStartAtLogin(enabled); // optimistic
+    try {
+      const updated = await api.saveSetup(deviceName.trim() || props.setup.deviceName, enabled);
+      props.onSetup(updated);
+    } catch (err) {
+      setStartAtLogin(!enabled); // revert on failure
+      props.onError(err instanceof Error ? err.message : String(err));
+    }
   }
 
   async function toggleFloatingIcon(enabled: boolean) {
@@ -1115,13 +1144,19 @@ function SettingsPanel(props: {
   }
 
   return (
-    <div className="modal-backdrop">
+    <div
+      className="modal-backdrop"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) props.onClose();
+      }}
+    >
       <section className="settings-panel">
         <header>
           <h2>Settings</h2>
           <button className="icon-button" onClick={props.onClose}><X size={18} /></button>
         </header>
 
+        <h3>Profile</h3>
         <div className="avatar-row">
           <span className="avatar-preview"><Avatar src={avatar} size={32} /></span>
           <div className="avatar-actions">
@@ -1135,10 +1170,20 @@ function SettingsPanel(props: {
 
         <label>
           Device name
-          <input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} />
+          <input
+            value={deviceName}
+            onChange={(event) => setDeviceName(event.target.value)}
+            onBlur={() => void saveName()}
+          />
         </label>
+
+        <h3>Behavior</h3>
         <label className="check-row">
-          <input type="checkbox" checked={startAtLogin} onChange={(event) => setStartAtLogin(event.target.checked)} />
+          <input
+            type="checkbox"
+            checked={startAtLogin}
+            onChange={(event) => void toggleStartAtLogin(event.target.checked)}
+          />
           Start SimplePass when I log in
         </label>
         <label className="check-row">
@@ -1157,6 +1202,7 @@ function SettingsPanel(props: {
           />
           Open received files &amp; links automatically
         </label>
+        <h3>Appearance</h3>
         <label className="check-row">
           <input
             type="checkbox"
@@ -1214,8 +1260,6 @@ function SettingsPanel(props: {
           )}
         </div>
         {updateStatus && <p className="update-status">{updateStatus}</p>}
-
-        <button className="primary" onClick={save}>Save</button>
       </section>
     </div>
   );
