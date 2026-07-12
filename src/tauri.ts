@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { ChatMessage, PeerDevice, SetupState, TransferProgress, TypingSignal } from "./types";
+import type { ChatMessage, MessageDeleted, PeerDevice, SetupState, TransferProgress, TypingSignal } from "./types";
 
 export const api = {
   getSetupState: () => invoke<SetupState>("get_setup_state"),
@@ -26,6 +26,8 @@ export const api = {
   deletePeer: (peerId: string) => invoke<void>("delete_peer", { peerId }),
   listMessages: (peerId: string) => invoke<ChatMessage[]>("list_messages", { peerId }),
   sendMessage: (peerId: string, text: string) => invoke<void>("send_message", { peerId, text }),
+  deleteMessage: (peerId: string, messageId: string) =>
+    invoke<void>("delete_message", { peerId, messageId }),
   sendTyping: (peerId: string, isTyping: boolean) =>
     invoke<void>("send_typing", { peerId, isTyping }),
   sendLink: (peerIds: string[], url: string) => invoke<TransferProgress[]>("send_link", { peerIds, url }),
@@ -47,6 +49,8 @@ export const events = {
     listen<PeerDevice>("pairing-request", (event) => handler(event.payload)),
   onMessage: (handler: (message: ChatMessage) => void) =>
     listen<ChatMessage>("chat-message", (event) => handler(event.payload)),
+  onMessageDeleted: (handler: (deleted: MessageDeleted) => void) =>
+    listen<MessageDeleted>("message-deleted", (event) => handler(event.payload)),
   onTransfer: (handler: (transfer: TransferProgress) => void) =>
     listen<TransferProgress>("transfer-progress", (event) => handler(event.payload)),
   onTyping: (handler: (signal: TypingSignal) => void) =>

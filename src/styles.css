@@ -341,7 +341,7 @@ input:focus {
 .workspace {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-columns: minmax(0, 1fr) 432px;
   gap: 18px;
   padding: 22px;
 }
@@ -534,13 +534,72 @@ input:focus {
   color: var(--ink-dim);
 }
 
+/* Flex column (not a fixed grid) so optional rows — offline notice, search bar —
+   can appear without stealing the message list's flexible height. */
 .chat-panel {
   position: relative;
   min-height: 0;
-  display: grid;
-  grid-template-rows: auto 1fr auto;
+  display: flex;
+  flex-direction: column;
   padding: 18px;
   background: var(--paper);
+}
+
+.chat-panel.empty-chat {
+  display: grid;
+}
+
+.chat-panel .message-list {
+  flex: 1;
+}
+
+.chat-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chat-header-actions .icon-button.active {
+  border-color: var(--clay);
+  color: var(--clay);
+}
+
+.chat-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.chat-search input {
+  min-height: 36px;
+  font-size: 13px;
+}
+
+.chat-search-count {
+  flex: none;
+  font-size: 12px;
+  color: var(--ink-dim);
+}
+
+.chat-search-empty {
+  align-self: center;
+  margin-top: 24px;
+  font-size: 13px;
+  color: var(--ink-dim);
+}
+
+/* Search-hit highlight inside bubbles. */
+.message mark {
+  background: rgba(200, 100, 60, 0.28);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+
+.message.sent mark {
+  background: rgba(255, 255, 255, 0.35);
+  color: inherit;
 }
 
 .chat-panel.drag-over {
@@ -592,6 +651,7 @@ input:focus {
 }
 
 .message {
+  position: relative;
   max-width: 82%;
   min-width: 0;
   margin: 0;
@@ -628,6 +688,43 @@ input:focus {
   color: var(--danger-ink);
   background: var(--danger-bg);
   border: 1px solid var(--danger-line);
+}
+
+/* Hover-revealed delete control, floated beside the bubble (in the empty side
+   of the row) so it never fights the bubble's own layout (text, grid-on-failed,
+   flex file rows) and never overflows the scroll container. */
+.message-delete {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  right: -30px;
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--card);
+  color: var(--ink);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.message.sent .message-delete {
+  right: auto;
+  left: -30px;
+}
+
+.message:hover .message-delete,
+.message-delete:focus-visible {
+  opacity: 1;
+}
+
+.message-delete:hover {
+  color: var(--danger);
+  border-color: var(--danger-line);
 }
 
 .message-status {

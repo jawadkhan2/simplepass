@@ -41,6 +41,11 @@ export interface ChatMessage {
   error?: string | null;
 }
 
+export interface MessageDeleted {
+  peerId: string;
+  messageId: string;
+}
+
 export interface TypingSignal {
   peerId: string;
   isTyping: boolean;

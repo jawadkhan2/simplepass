@@ -11,9 +11,11 @@ import {
   Minus,
   Monitor,
   RefreshCw,
+  Search,
   Settings,
   Share2,
   Square,
+  Trash2,
   WifiOff,
   X
 } from "lucide-react";
@@ -249,6 +251,15 @@ export default function App() {
         // alerted without being interrupted while the app is already in front.
         // Clicking the toast surfaces the window (see the onAction effect below).
         if (message.direction === "received") void notifyIfHidden(message);
+      }),
+      events.onMessageDeleted(({ peerId, messageId }) => {
+        // Covers both local deletes (echoed by the backend) and remote
+        // retractions from the peer. Closed chats reload via listMessages.
+        setMessages((current) =>
+          peerId === chatPeerIdRef.current
+            ? current.filter((message) => message.id !== messageId)
+            : current
+        );
       }),
       events.onTransfer((transfer) => {
         // Completed rows are held for a beat so the success check can play. Failed
@@ -782,7 +793,34 @@ function PairingModal({ peer, onAccept, onDeny }: { peer: PeerDevice; onAccept: 
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+// Wrap case-insensitive matches of `query` in <mark> so search hits are visible
+// inside the bubble text.
+function highlightText(value: string, query: string): React.ReactNode {
+  if (!query) return value;
+  const lower = value.toLowerCase();
+  const q = query.toLowerCase();
+  const parts: React.ReactNode[] = [];
+  let index = 0;
+  let found = lower.indexOf(q);
+  while (found !== -1) {
+    if (found > index) parts.push(value.slice(index, found));
+    parts.push(<mark key={found}>{value.slice(found, found + q.length)}</mark>);
+    index = found + q.length;
+    found = lower.indexOf(q, index);
+  }
+  parts.push(value.slice(index));
+  return parts;
+}
+
+function MessageBubble({
+  message,
+  highlight = "",
+  onDelete
+}: {
+  message: ChatMessage;
+  highlight?: string;
+  onDelete: (message: ChatMessage) => void;
+}) {
   const failed = message.direction === "sent" && message.deliveryState === "failed";
   const failureNote = failed ? (
     <span className="message-status">
@@ -790,6 +828,27 @@ function MessageBubble({ message }: { message: ChatMessage }) {
       {message.error ?? "Not delivered."}
     </span>
   ) : null;
+  // Deleting a sent message also retracts the peer's copy; deleting a received
+  // one only clears it here (peers can only retract their own messages).
+  const deleteButton = (
+    <button
+      type="button"
+      className="message-delete"
+      title={
+        message.direction === "sent" && message.deliveryState !== "failed"
+          ? "Delete for both devices"
+          : "Delete from this device"
+      }
+      aria-label="Delete message"
+      onClick={(event) => {
+        event.stopPropagation();
+        onDelete(message);
+      }}
+      onKeyDown={(event) => event.stopPropagation()}
+    >
+      <Trash2 size={13} />
+    </button>
+  );
 
   if (message.kind === "file") {
     const path = message.filePath;
@@ -812,11 +871,12 @@ function MessageBubble({ message }: { message: ChatMessage }) {
       >
         <span className="file-icon"><FileText size={18} /></span>
         <div className="file-meta">
-          <strong>{message.fileName ?? "File"}</strong>
+          <strong>{message.fileName ? highlightText(message.fileName, highlight) : "File"}</strong>
           <small>{formatBytes(message.fileSize)}{message.direction === "received" ? " · saved to Downloads" : ""}</small>
         </div>
         {openable && <span className="file-open">Open</span>}
         {failureNote}
+        {deleteButton}
       </div>
     );
   }
@@ -838,16 +898,18 @@ function MessageBubble({ message }: { message: ChatMessage }) {
         }}
       >
         <span className="file-icon"><LinkIcon size={16} /></span>
-        <span className="link-text">{url}</span>
+        <span className="link-text">{highlightText(url, highlight)}</span>
         {failureNote}
+        {deleteButton}
       </div>
     );
   }
 
   return (
     <p className={`message ${message.direction}${failed ? " failed" : ""}`}>
-      <span>{message.text}</span>
+      <span>{highlightText(message.text, highlight)}</span>
       {failureNote}
+      {deleteButton}
     </p>
   );
 }
@@ -868,15 +930,42 @@ function ChatPanel({
   onError: (message: string) => void;
 }) {
   const [text, setText] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [query, setQuery] = useState("");
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const typingSent = useRef(false);
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const peerId = peer?.id ?? null;
   const peerOffline = peer?.status === "offline";
+  const trimmedQuery = query.trim();
+
+  // A search matches a message's text, file name, or URL (case-insensitive).
+  const visibleMessages = useMemo(() => {
+    if (!trimmedQuery) return messages;
+    const q = trimmedQuery.toLowerCase();
+    return messages.filter((message) =>
+      [message.text, message.fileName, message.url].some((field) =>
+        field?.toLowerCase().includes(q)
+      )
+    );
+  }, [messages, trimmedQuery]);
 
   useEffect(() => {
+    // While a search filter is active, don't yank the view to the bottom.
+    if (trimmedQuery) return;
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, peerTyping]);
+  }, [messages, peerTyping, trimmedQuery]);
+
+  // Reset the search when the chat closes or switches peers.
+  useEffect(() => {
+    setSearchOpen(false);
+    setQuery("");
+  }, [peerId]);
+
+  function closeSearch() {
+    setSearchOpen(false);
+    setQuery("");
+  }
 
   // Stop signalling "typing" when the chat closes or switches peers.
   useEffect(() => {
@@ -949,8 +1038,39 @@ function ChatPanel({
             <span>{peerTyping ? "typing…" : STATUS_LABEL[peer.status]}</span>
           </div>
         </div>
-        <button className="icon-button" title="Close chat" onClick={onClose}><X size={18} /></button>
+        <div className="chat-header-actions">
+          <button
+            className={`icon-button${searchOpen ? " active" : ""}`}
+            title={searchOpen ? "Close search" : "Search messages"}
+            onClick={() => (searchOpen ? closeSearch() : setSearchOpen(true))}
+          >
+            <Search size={17} />
+          </button>
+          <button className="icon-button" title="Close chat" onClick={onClose}><X size={18} /></button>
+        </div>
       </header>
+      {searchOpen && (
+        <div className="chat-search">
+          <input
+            autoFocus
+            value={query}
+            placeholder="Search this chat"
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              // Escape closes the search, not the chat.
+              if (event.key === "Escape") {
+                event.stopPropagation();
+                closeSearch();
+              }
+            }}
+          />
+          {trimmedQuery && (
+            <span className="chat-search-count">
+              {visibleMessages.length} {visibleMessages.length === 1 ? "match" : "matches"}
+            </span>
+          )}
+        </div>
+      )}
       {peerOffline && (
         <div className="offline-notice" role="status">
           <WifiOff size={16} />
@@ -958,9 +1078,24 @@ function ChatPanel({
         </div>
       )}
       <div className="message-list">
-        {messages.map((message) => (
-          <MessageBubble key={message.id} message={message} />
+        {visibleMessages.map((message) => (
+          <MessageBubble
+            key={message.id}
+            message={message}
+            highlight={trimmedQuery}
+            onDelete={(target) => {
+              // The message-list update arrives via the message-deleted event.
+              void api
+                .deleteMessage(target.peerId, target.id)
+                .catch((err) =>
+                  onError(err instanceof Error ? err.message : String(err))
+                );
+            }}
+          />
         ))}
+        {trimmedQuery && visibleMessages.length === 0 && (
+          <p className="chat-search-empty">No messages match "{trimmedQuery}".</p>
+        )}
         {peerTyping && (
           <div className="message received typing-bubble">
             <span className="typing-dot" />

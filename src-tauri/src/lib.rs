@@ -343,10 +343,22 @@ enum WireMessage {
     Chat {
         peer_id: String,
         text: String,
+        // Sender's message id, so both sides store the same id and a later
+        // DeleteMessage can address it. `default` keeps older peers compatible.
+        #[serde(default)]
+        message_id: Option<String>,
     },
     Link {
         peer_id: String,
         url: String,
+        #[serde(default)]
+        message_id: Option<String>,
+    },
+    // Retracts a message the sender previously sent us; the receiver deletes its
+    // stored copy. Only messages the sender authored can be retracted.
+    DeleteMessage {
+        peer_id: String,
+        message_id: String,
     },
     FileStart {
         peer_id: String,
@@ -734,14 +746,15 @@ fn send_message(
     ensure_paired(&state, &peer_id)?;
     let peer = get_peer(&state, &peer_id)?;
     let local_id = existing_device_id(&state)?;
+    let mut message = make_chat_message(peer_id.clone(), "sent", "text", text.clone());
     let send_result = send_wire(
         &peer,
         WireMessage::Chat {
             peer_id: local_id,
-            text: text.clone(),
+            text,
+            message_id: Some(message.id.clone()),
         },
     );
-    let mut message = make_chat_message(peer_id.clone(), "sent", "text", text);
     if send_result.is_err() {
         let error = delivery_failure_text(&peer.name);
         mark_message_failed(&mut message, error);
@@ -757,13 +770,123 @@ fn receive_message(
     state: &State<AppState>,
     peer_id: String,
     text: String,
+    message_id: Option<String>,
 ) -> AppResult<()> {
     validate_message_text(&text)?;
     ensure_paired(state, &peer_id)?;
-    let message = make_chat_message(peer_id, "received", "text", text);
+    let mut message = make_chat_message(peer_id, "received", "text", text);
+    adopt_wire_message_id(state, &mut message, message_id);
     // The toast (and its click-to-open behavior) is raised on the frontend from
     // the `chat-message` event, so a click can focus the window via `show_window`.
     record_chat_message(app, state, message)
+}
+
+/// Adopts the sender-supplied message id (so a later DeleteMessage from that
+/// peer can address this row) — but only when it is a sane id and not already
+/// in use, so a peer can't collide with or shadow an existing message.
+fn adopt_wire_message_id(
+    state: &State<AppState>,
+    message: &mut ChatMessage,
+    message_id: Option<String>,
+) {
+    let Some(id) = message_id else { return };
+    let sane = !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == ':');
+    if !sane {
+        return;
+    }
+    let taken = state
+        .inner
+        .lock()
+        .map(|persisted| persisted.messages.iter().any(|existing| existing.id == id))
+        .unwrap_or(true);
+    if !taken {
+        message.id = id;
+    }
+}
+
+// Deletes a message this device previously sent to `peer_id`, or a received one
+// (received deletions stay local: peers may only retract their own messages).
+#[tauri::command]
+fn delete_message(
+    app: AppHandle,
+    state: State<AppState>,
+    peer_id: String,
+    message_id: String,
+) -> AppResult<()> {
+    let direction = {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        let Some(index) = persisted
+            .messages
+            .iter()
+            .position(|message| message.id == message_id && message.peer_id == peer_id)
+        else {
+            return Err("Message not found.".to_string());
+        };
+        let removed = persisted.messages.remove(index);
+        save_state(&state.path, &persisted)?;
+        removed.direction
+    };
+    app.emit(
+        "message-deleted",
+        serde_json::json!({ "peerId": peer_id, "messageId": message_id }),
+    )
+    .map_err(|err| err.to_string())?;
+    // Best-effort remote retraction: only for messages we authored, and only if
+    // the peer is still paired. A failure (peer offline) leaves their copy; the
+    // local deletion above already succeeded.
+    if direction == "sent" {
+        if let Ok(peer) = get_peer(&state, &peer_id) {
+            if peer.trust_state == "paired" {
+                let local_id = existing_device_id(&state)?;
+                let _ = send_wire(
+                    &peer,
+                    WireMessage::DeleteMessage {
+                        peer_id: local_id,
+                        message_id,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+// Handles a DeleteMessage from a paired peer. Internal only (called from
+// `handle_message`). The peer may only retract messages it sent us — the id,
+// owning peer, and "received" direction must all match.
+fn receive_delete_message(
+    app: &AppHandle,
+    state: &State<AppState>,
+    peer_id: String,
+    message_id: String,
+) -> AppResult<()> {
+    ensure_paired(state, &peer_id)?;
+    let removed = {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        let before = persisted.messages.len();
+        persisted.messages.retain(|message| {
+            !(message.id == message_id
+                && message.peer_id == peer_id
+                && message.direction == "received")
+        });
+        let removed = persisted.messages.len() != before;
+        if removed {
+            save_state(&state.path, &persisted)?;
+        }
+        removed
+    };
+    if removed {
+        app.emit(
+            "message-deleted",
+            serde_json::json!({ "peerId": peer_id, "messageId": message_id }),
+        )
+        .map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 // Records a link received from a paired peer. Internal only (called from
@@ -777,6 +900,7 @@ fn receive_link(
     state: &State<AppState>,
     peer_id: String,
     url: String,
+    message_id: Option<String>,
 ) -> AppResult<()> {
     ensure_paired(state, &peer_id)?;
     if validate_link_url(&url).is_err() {
@@ -785,6 +909,7 @@ fn receive_link(
     let auto = auto_open_enabled(state)?;
     let mut message = make_chat_message(peer_id, "received", "link", url.clone());
     message.url = Some(url.clone());
+    adopt_wire_message_id(state, &mut message, message_id);
     record_chat_message(app, state, message)?;
     // Rate-limit auto-open so a peer streaming many links can't spawn a burst of
     // browser tabs. Links that exceed the rate are still recorded in chat.
@@ -816,29 +941,26 @@ fn send_link(
         transfer.state = "sending".to_string();
         emit_transfer(&app, transfer.clone())?;
         let peer = get_peer(&state, &transfer.peer_id)?;
+        let mut message = make_chat_message(transfer.peer_id.clone(), "sent", "link", url.clone());
+        message.url = Some(url.clone());
         match send_wire(
             &peer,
             WireMessage::Link {
                 peer_id: local_id.clone(),
                 url: url.clone(),
+                message_id: Some(message.id.clone()),
             },
         ) {
             Ok(()) => {
                 transfer.progress = 100;
                 transfer.state = "complete".to_string();
                 transfer.error = None;
-                let mut message =
-                    make_chat_message(transfer.peer_id.clone(), "sent", "link", url.clone());
-                message.url = Some(url.clone());
                 let _ = record_chat_message(&app, &state, message);
             }
             Err(_) => {
                 let error = delivery_failure_text(&transfer.peer_name);
                 transfer.state = "failed".to_string();
                 transfer.error = Some(error.clone());
-                let mut message =
-                    make_chat_message(transfer.peer_id.clone(), "sent", "link", url.clone());
-                message.url = Some(url.clone());
                 mark_message_failed(&mut message, error);
                 let _ = record_chat_message(&app, &state, message);
                 let _ = mark_peer_offline(&app, &state, &transfer.peer_id);
@@ -1183,6 +1305,10 @@ fn send_one_file(
         if !cancelled && !read_failed && !conn.failed {
             let mut message =
                 make_chat_message(conn.peer_id.clone(), "sent", "file", file_name.clone());
+            // Both sides derive the same id (receiver does this in
+            // `receive_file_end`), so deleting the sent file message can retract
+            // the receiver's copy via DeleteMessage.
+            message.id = transfer_row_id(&transfer_id, &conn.peer_id);
             message.file_name = Some(file_name.clone());
             message.file_size = Some(total);
             message.file_path = record_path.map(|p| p.to_string());
@@ -1614,6 +1740,7 @@ pub fn run() {
             rescan_peers,
             list_messages,
             send_message,
+            delete_message,
             send_link,
             send_files,
             stage_file_chunk,
@@ -1803,11 +1930,25 @@ fn handle_message(
             )?;
             send_profile_to_peer(state, &device_id);
         }
-        WireMessage::Chat { peer_id, text } => {
-            receive_message(app, state, peer_id, text)?;
+        WireMessage::Chat {
+            peer_id,
+            text,
+            message_id,
+        } => {
+            receive_message(app, state, peer_id, text, message_id)?;
         }
-        WireMessage::Link { peer_id, url } => {
-            receive_link(app, state, peer_id, url)?;
+        WireMessage::Link {
+            peer_id,
+            url,
+            message_id,
+        } => {
+            receive_link(app, state, peer_id, url, message_id)?;
+        }
+        WireMessage::DeleteMessage {
+            peer_id,
+            message_id,
+        } => {
+            receive_delete_message(app, state, peer_id, message_id)?;
         }
         WireMessage::Typing { peer_id, is_typing } => {
             app.emit(
@@ -2328,6 +2469,7 @@ fn envelope_peer_id(message: &WireMessage) -> AppResult<&str> {
     match message {
         WireMessage::Chat { peer_id, .. }
         | WireMessage::Link { peer_id, .. }
+        | WireMessage::DeleteMessage { peer_id, .. }
         | WireMessage::FileStart { peer_id, .. }
         | WireMessage::FileChunk { peer_id, .. }
         | WireMessage::FileEnd { peer_id, .. }
@@ -3257,6 +3399,15 @@ fn receive_file_end(
     }
 
     let mut message = make_chat_message(peer_id.clone(), "received", "file", file_name.clone());
+    // Mirror of the sender's file-message id (see the sent-side recording in the
+    // send loop): transfer_id + our device id. Routed through the adopt helper
+    // because transfer_id is peer-controlled.
+    let local_id = existing_device_id(state)?;
+    adopt_wire_message_id(
+        state,
+        &mut message,
+        Some(transfer_row_id(&transfer_id, &local_id)),
+    );
     message.file_name = Some(file_name.clone());
     message.file_size = Some(expected_size);
     message.file_path = Some(path.to_string_lossy().to_string());
@@ -3491,6 +3642,7 @@ mod tests {
         let message = WireMessage::Chat {
             peer_id: "sender-device".to_string(),
             text: "hello".to_string(),
+            message_id: None,
         };
         let envelope = encrypt_message(
             envelope_peer_id(&message).expect("peer id"),
@@ -3564,10 +3716,16 @@ mod tests {
             device
         }));
 
-        // Chat, links, files, typing, profile must never be accepted in the clear.
+        // Chat, links, files, typing, profile, deletions must never be accepted
+        // in the clear.
         assert!(!plain_envelope_allowed(&WireMessage::Chat {
             peer_id: "peer".to_string(),
             text: "hi".to_string(),
+            message_id: None,
+        }));
+        assert!(!plain_envelope_allowed(&WireMessage::DeleteMessage {
+            peer_id: "peer".to_string(),
+            message_id: "m1".to_string(),
         }));
         assert!(!plain_envelope_allowed(&WireMessage::FileChunk {
             peer_id: "peer".to_string(),
@@ -3581,6 +3739,7 @@ mod tests {
         let message = WireMessage::Chat {
             peer_id: "claimed-peer".to_string(),
             text: "hello".to_string(),
+            message_id: None,
         };
 
         assert!(verify_authenticated_peer("claimed-peer", &message).is_ok());
