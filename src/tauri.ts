@@ -1,6 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { ChatMessage, MessageDeleted, PeerDevice, SetupState, TransferProgress, TypingSignal } from "./types";
+import type {
+  ChatMessage,
+  MessageDeleted,
+  MessageUpdated,
+  PeerDevice,
+  QueuedFile,
+  SetupState,
+  TransferProgress,
+  TypingSignal
+} from "./types";
 
 export const api = {
   getSetupState: () => invoke<SetupState>("get_setup_state"),
@@ -37,6 +46,9 @@ export const api = {
   sendStagedFile: (peerIds: string[], sessionId: string, fileName: string) =>
     invoke<void>("send_staged_file", { peerIds, sessionId, fileName }),
   cancelFileSend: (transferId: string) => invoke<void>("cancel_file_send", { transferId }),
+  listOutbox: () => invoke<QueuedFile[]>("list_outbox"),
+  removeFromOutbox: (id: string) => invoke<void>("remove_from_outbox", { id }),
+  retryOutbox: () => invoke<void>("retry_outbox"),
   clearMessages: () => invoke<void>("clear_messages"),
   openPath: (path: string) => invoke<void>("open_path", { path }),
   openLink: (url: string) => invoke<void>("open_link", { url })
@@ -51,6 +63,10 @@ export const events = {
     listen<ChatMessage>("chat-message", (event) => handler(event.payload)),
   onMessageDeleted: (handler: (deleted: MessageDeleted) => void) =>
     listen<MessageDeleted>("message-deleted", (event) => handler(event.payload)),
+  onMessageUpdated: (handler: (updated: MessageUpdated) => void) =>
+    listen<MessageUpdated>("message-updated", (event) => handler(event.payload)),
+  onOutboxChanged: (handler: (outbox: QueuedFile[]) => void) =>
+    listen<QueuedFile[]>("outbox-changed", (event) => handler(event.payload)),
   onTransfer: (handler: (transfer: TransferProgress) => void) =>
     listen<TransferProgress>("transfer-progress", (event) => handler(event.payload)),
   onTyping: (handler: (signal: TypingSignal) => void) =>

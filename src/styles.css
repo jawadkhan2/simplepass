@@ -18,6 +18,11 @@
   --danger-bg: #fdf0e8;
   --danger-line: var(--clay-soft);
 
+  /* Waiting / queued (offline outbox) states, built on the gold accent. */
+  --wait-ink: #8a6114;
+  --wait-bg: #fbf1dc;
+  --wait-line: rgba(216, 161, 58, 0.55);
+
   /* Motion tokens — one shared set of durations + easings so every
      animation in the app speaks the same language. */
   --dur-1: 120ms; /* taps, hovers */
@@ -58,6 +63,9 @@
   --danger-ink: #f6c0a6;
   --danger-bg: rgba(224, 118, 76, 0.14);
   --danger-line: rgba(224, 118, 76, 0.5);
+  --wait-ink: #f0c873;
+  --wait-bg: rgba(230, 180, 80, 0.12);
+  --wait-line: rgba(230, 180, 80, 0.45);
 }
 
 /* A handful of spots hardcode light colors that the tokens don't reach; recolor
@@ -1857,4 +1865,120 @@ button:active:not(:disabled) {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+}
+
+/* ============================================================ */
+/*  Offline outbox — files queued for a computer that is        */
+/*  offline; delivered automatically when it comes back.        */
+/* ============================================================ */
+.outbox {
+  display: grid;
+  gap: 8px;
+}
+
+.outbox-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.outbox-toggle {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--wait-ink);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.outbox-toggle span {
+  overflow: hidden;
+  color: var(--ink-dim);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.outbox-toggle svg {
+  flex: none;
+}
+
+.outbox-retry {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--ink-dim);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color var(--dur-1) ease, border-color var(--dur-1) ease;
+}
+
+.outbox-retry:hover {
+  color: var(--clay);
+  border-color: var(--clay);
+}
+
+.transfer-row.waiting {
+  border-color: var(--wait-line);
+  background: var(--wait-bg);
+}
+
+.transfer-waiting {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--wait-ink);
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.tile-queued {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid var(--wait-line);
+  border-radius: 999px;
+  background: var(--wait-bg);
+  color: var(--wait-ink);
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+.message.sent.queued {
+  display: grid;
+  gap: 7px;
+  color: var(--ink);
+  background: var(--wait-bg);
+  border: 1px dashed var(--wait-line);
+}
+
+.message-status.queued {
+  color: var(--wait-ink);
+}
+
+.fi-status.queued {
+  background: rgba(168, 118, 24, 0.95);
+}
+
+.message.file-message.queued {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.message.file-message.queued .message-status {
+  flex-basis: 100%;
 }

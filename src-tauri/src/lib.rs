@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -79,6 +79,19 @@ const MAX_STAGED_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 /// peer from forcing a burst of browser tabs / viewer launches ("tab bomb") by
 /// streaming many links or files in quick succession while auto-open is enabled.
 const AUTO_OPEN_MIN_INTERVAL_MS: i64 = 1200;
+/// Cap on files waiting in the offline outbox, so `state.json` stays bounded.
+const MAX_OUTBOX_FILES: usize = 500;
+/// How often the outbox worker wakes on its own (without a kick) to retry.
+const OUTBOX_TICK: std::time::Duration = std::time::Duration::from_secs(20);
+/// Minimum gap between delivery attempts to an *online* peer (or one just kicked
+/// by a new enqueue). Stops a peer that broadcasts discovery but refuses TCP from
+/// driving a tight fail -> offline -> online -> retry loop.
+const OUTBOX_RETRY_MIN_MS: i64 = 15_000;
+/// Gap between blind delivery probes to a peer that discovery says is *offline*.
+/// Covers networks where UDP broadcast is filtered but TCP still works.
+const OUTBOX_OFFLINE_PROBE_MS: i64 = 5 * 60_000;
+/// Bounded kick channel into the outbox worker; extra kicks are coalesced.
+const OUTBOX_KICK_CAPACITY: usize = 64;
 
 /// Number of live inbound connection-handler threads. Bounded by
 /// `MAX_CONNECTION_THREADS` in `run_tcp_listener`.
@@ -283,6 +296,32 @@ struct TransferProgress {
     error: Option<String>,
 }
 
+/// A file waiting in the offline outbox for one peer. Created when the peer is
+/// offline (or unreachable) at send time; the outbox worker delivers it the next
+/// time the peer is reachable. One entry per (file, peer).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueuedFile {
+    id: String,
+    peer_id: String,
+    /// Source path streamed on delivery. Either the user's original file, or a
+    /// private copy under the app-data `outbox/` dir for widget byte-drops.
+    path: String,
+    file_name: String,
+    size: u64,
+    queued_at: i64,
+    /// Local path stored on the sent chat message for click-to-open.
+    #[serde(default)]
+    record_path: Option<String>,
+    /// Id of the "queued" chat message that represents this entry in chat. On
+    /// delivery that message is updated in place to "delivered".
+    message_id: String,
+    #[serde(default)]
+    attempts: u32,
+    #[serde(default)]
+    last_attempt: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedState {
@@ -290,6 +329,8 @@ struct PersistedState {
     peers: Vec<PeerDevice>,
     messages: Vec<ChatMessage>,
     transfers: Vec<TransferProgress>,
+    #[serde(default)]
+    outbox: Vec<QueuedFile>,
 }
 
 impl Default for PersistedState {
@@ -311,6 +352,7 @@ impl Default for PersistedState {
             peers: Vec::new(),
             messages: Vec::new(),
             transfers: Vec::new(),
+            outbox: Vec::new(),
         }
     }
 }
@@ -425,6 +467,20 @@ struct AppState {
     /// `save_widget_position` to ignore those so the persisted position stays the
     /// resting anchor rather than a transient expanded offset.
     widget_active: AtomicBool,
+    /// Wakes the outbox worker (see `run_outbox`). Coalescing: a full channel just
+    /// drops the kick, since the worker re-scans the whole outbox on every wake.
+    outbox_kick: mpsc::SyncSender<OutboxKick>,
+    /// The outbox entry currently being streamed by the worker, with the transfer
+    /// id of that attempt, so removing the entry can cancel the live stream.
+    outbox_inflight: Mutex<Option<(String, String)>>,
+}
+
+enum OutboxKick {
+    /// Something changed for this peer (came online, new file queued). Attempts
+    /// still respect `OUTBOX_RETRY_MIN_MS`.
+    Peer(String),
+    /// User pressed "Retry now": ignore every backoff on this pass.
+    Force,
 }
 
 /// One open TCP connection to a target peer for an in-flight outgoing file.
@@ -673,6 +729,8 @@ fn revoke_peer(app: AppHandle, state: State<AppState>, peer_id: String) -> AppRe
         save_state(&state.path, &persisted)?;
         peers
     };
+    // Queued files can no longer be delivered without a shared secret.
+    fail_outbox_for_peer(&app, &state, &peer_id, "Not delivered. This device was unpaired.");
     app.emit("peers-changed", peers)
         .map_err(|err| err.to_string())
 }
@@ -683,7 +741,7 @@ fn revoke_peer(app: AppHandle, state: State<AppState>, peer_id: String) -> AppRe
 /// a fresh *unpaired* peer; deletion clears trust and history, not discovery.
 #[tauri::command]
 fn delete_peer(app: AppHandle, state: State<AppState>, peer_id: String) -> AppResult<()> {
-    let peers = {
+    let (peers, dropped) = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
         persisted.peers.retain(|peer| peer.id != peer_id);
         persisted
@@ -692,10 +750,24 @@ fn delete_peer(app: AppHandle, state: State<AppState>, peer_id: String) -> AppRe
         persisted
             .transfers
             .retain(|transfer| transfer.peer_id != peer_id);
+        let dropped: Vec<QueuedFile> = persisted
+            .outbox
+            .iter()
+            .filter(|item| item.peer_id == peer_id)
+            .cloned()
+            .collect();
+        persisted.outbox.retain(|item| item.peer_id != peer_id);
         let peers = persisted.peers.clone();
         save_state(&state.path, &persisted)?;
-        peers
+        (peers, dropped)
     };
+    if !dropped.is_empty() {
+        for item in &dropped {
+            cancel_inflight_outbox(&state, &item.id);
+            cleanup_outbox_source(&state, &item.path);
+        }
+        emit_outbox(&app, &state);
+    }
     app.emit("peers-changed", peers)
         .map_err(|err| err.to_string())
 }
@@ -817,7 +889,7 @@ fn delete_message(
     peer_id: String,
     message_id: String,
 ) -> AppResult<()> {
-    let direction = {
+    let (direction, was_queued, dequeued) = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
         let Some(index) = persisted
             .messages
@@ -827,18 +899,38 @@ fn delete_message(
             return Err("Message not found.".to_string());
         };
         let removed = persisted.messages.remove(index);
+        // Deleting a queued file's bubble also takes it out of the outbox.
+        let dequeued: Vec<QueuedFile> = persisted
+            .outbox
+            .iter()
+            .filter(|item| item.message_id == message_id)
+            .cloned()
+            .collect();
+        persisted.outbox.retain(|item| item.message_id != message_id);
         save_state(&state.path, &persisted)?;
-        removed.direction
+        (
+            removed.direction,
+            removed.delivery_state == "queued",
+            dequeued,
+        )
     };
     app.emit(
         "message-deleted",
         serde_json::json!({ "peerId": peer_id, "messageId": message_id }),
     )
     .map_err(|err| err.to_string())?;
+    if !dequeued.is_empty() {
+        for item in &dequeued {
+            cancel_inflight_outbox(&state, &item.id);
+            cleanup_outbox_source(&state, &item.path);
+        }
+        emit_outbox(&app, &state);
+    }
     // Best-effort remote retraction: only for messages we authored, and only if
     // the peer is still paired. A failure (peer offline) leaves their copy; the
-    // local deletion above already succeeded.
-    if direction == "sent" {
+    // local deletion above already succeeded. A queued file never reached the
+    // peer, so there is nothing to retract.
+    if direction == "sent" && !was_queued {
         if let Ok(peer) = get_peer(&state, &peer_id) {
             if peer.trust_state == "paired" {
                 let local_id = existing_device_id(&state)?;
@@ -983,10 +1075,33 @@ fn transfer_row_id(transfer_id: &str, peer_id: &str) -> String {
     format!("{transfer_id}:{peer_id}")
 }
 
+/// Resolve + validate send targets up front so obvious problems surface
+/// synchronously instead of disappearing into a worker thread. Offline peers are
+/// valid targets: their files go to the outbox.
+fn resolve_file_targets(
+    state: &State<AppState>,
+    peer_ids: &[String],
+) -> AppResult<Vec<(PeerDevice, String)>> {
+    let mut targets = Vec::new();
+    for peer_id in peer_ids {
+        let peer = get_peer(state, peer_id)?;
+        if peer.trust_state != "paired" {
+            return Err(format!("{} is not paired.", peer.name));
+        }
+        let secret = peer
+            .shared_secret
+            .clone()
+            .ok_or_else(|| format!("{} does not have a shared secret yet.", peer.name))?;
+        targets.push((peer, secret));
+    }
+    Ok(targets)
+}
+
 /// Streams one or more files (read from disk) to every paired target. Runs on a
 /// background thread so the command returns immediately; progress and completion
 /// are reported through `transfer-progress` events. Each file gets its own
-/// `transfer_id` and a cancel flag that `cancel_file_send` can trip.
+/// `transfer_id` and a cancel flag that `cancel_file_send` can trip. Targets that
+/// are offline or unreachable get the file queued in the outbox instead.
 #[tauri::command]
 fn send_files(
     app: AppHandle,
@@ -1001,63 +1116,213 @@ fn send_files(
         return Ok(());
     }
     let local_id = existing_device_id(&state)?;
-
-    // Resolve + validate targets once, up front, so obvious problems surface
-    // synchronously instead of disappearing into the worker thread.
-    let mut targets = Vec::new();
-    for peer_id in &peer_ids {
-        let peer = get_peer(&state, peer_id)?;
-        if peer.trust_state != "paired" {
-            return Err(format!("{} is not paired.", peer.name));
-        }
-        if peer.host.trim().is_empty() {
-            return Err(format!(
-                "{} does not have a network address yet.",
-                peer.name
-            ));
-        }
-        let secret = peer
-            .shared_secret
-            .clone()
-            .ok_or_else(|| format!("{} does not have a shared secret yet.", peer.name))?;
-        targets.push((peer, secret));
-    }
+    let targets = resolve_file_targets(&state, &peer_ids)?;
 
     thread::spawn(move || {
         for path in paths {
-            send_one_file(&app, &local_id, &targets, &path, None, Some(&path));
+            deliver_or_queue(&app, &local_id, &targets, &path, None, Some(&path), None);
         }
     });
     Ok(())
 }
 
-/// Connect to every target, stream a single file in chunks, and record the sent
-/// message. Best-effort: a per-peer failure marks only that row failed; a cancel
-/// stops the stream and skips the chat record.
+/// Send one file to every online target now, and queue it in the outbox for every
+/// target that is offline or turns out to be unreachable.
 ///
-/// `display_name` overrides the name shown to the receiver (used when streaming a
-/// staged temp file whose on-disk name is a random session id). `record_path` is
-/// the local path stored on the sent chat message for click-to-open, or `None`
-/// when the source is transient (e.g. a widget byte-drop) and has no stable path.
-fn send_one_file(
+/// `transient_source` is set when `path` is a temp file the caller deletes after
+/// this returns (a widget byte-drop staged in the temp dir). If anything needs
+/// queueing, that file is first copied into the app-data outbox dir so the queued
+/// entry still has bytes to send later.
+fn deliver_or_queue(
     app: &AppHandle,
     local_id: &str,
     targets: &[(PeerDevice, String)],
     path: &str,
     display_name: Option<&str>,
     record_path: Option<&str>,
+    transient_source: Option<&Path>,
 ) {
     let state = app.state::<AppState>();
-    let transfer_id = Uuid::new_v4().to_string();
-    let source = Path::new(path);
     let file_name = display_name
         .map(|name| name.to_string())
-        .unwrap_or_else(|| {
-            source
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| "file".to_string())
-        });
+        .unwrap_or_else(|| file_name_of(path));
+
+    // An unreadable source fails for everyone; let send_one_file report it.
+    let size = match fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(_) => {
+            send_one_file(
+                app,
+                local_id,
+                targets,
+                FileSend {
+                    path,
+                    display_name,
+                    record_path,
+                    transfer_id: None,
+                    replaces_message: None,
+                },
+            );
+            return;
+        }
+    };
+
+    // Use the freshest peer status (the snapshot in `targets` was taken when the
+    // command ran). A peer with no address yet can't be dialed either.
+    let (online, offline): (Vec<_>, Vec<_>) = targets.iter().cloned().partition(|(peer, _)| {
+        get_peer(&state, &peer.id)
+            .map(|fresh| fresh.status == "online" && !fresh.host.trim().is_empty())
+            .unwrap_or(false)
+    });
+    // (peer, transfer id of the failed live attempt, if there was one)
+    let mut to_queue: Vec<(PeerDevice, Option<String>)> =
+        offline.into_iter().map(|(peer, _)| (peer, None)).collect();
+
+    if !online.is_empty() {
+        let outcome = send_one_file(
+            app,
+            local_id,
+            &online,
+            FileSend {
+                path,
+                display_name,
+                record_path,
+                transfer_id: None,
+                replaces_message: None,
+            },
+        );
+        if outcome.source_error.is_some() {
+            return;
+        }
+        to_queue.extend(
+            online
+                .into_iter()
+                .filter(|(peer, _)| outcome.unreachable.contains(&peer.id))
+                .map(|(peer, _)| (peer, Some(outcome.transfer_id.clone()))),
+        );
+    }
+    if to_queue.is_empty() {
+        return;
+    }
+
+    let source = match transient_source {
+        Some(temp) => match copy_into_outbox(&state, temp) {
+            Ok(dest) => dest.to_string_lossy().to_string(),
+            Err(err) => {
+                for (peer, _) in &to_queue {
+                    report_queue_failure(app, &state, peer, &file_name, size, record_path, err.clone());
+                }
+                return;
+            }
+        },
+        None => path.to_string(),
+    };
+    for (peer, attempt_id) in &to_queue {
+        if let Err(err) = enqueue_file(
+            app,
+            &state,
+            peer,
+            &source,
+            &file_name,
+            size,
+            record_path,
+            attempt_id.as_deref(),
+        ) {
+            report_queue_failure(app, &state, peer, &file_name, size, record_path, err);
+        }
+    }
+    // A private outbox copy nobody ended up referencing (every enqueue failed).
+    if transient_source.is_some() {
+        cleanup_outbox_source(&state, &source);
+    }
+}
+
+/// Record a file that could neither be delivered nor queued as a failed send.
+fn report_queue_failure(
+    app: &AppHandle,
+    state: &State<AppState>,
+    peer: &PeerDevice,
+    file_name: &str,
+    size: u64,
+    record_path: Option<&str>,
+    error: String,
+) {
+    let transfer_id = Uuid::new_v4().to_string();
+    let row = file_row(&transfer_id, peer, file_name, 0, "failed", Some(error.clone()));
+    persist_transfer_row(state, row.clone());
+    let _ = emit_transfer(app, row);
+    let _ = record_failed_file_message(
+        app,
+        state,
+        peer.id.clone(),
+        file_name.to_string(),
+        size,
+        record_path,
+        error,
+    );
+}
+
+fn file_name_of(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string())
+}
+
+/// What to stream in `send_one_file`.
+struct FileSend<'a> {
+    path: &'a str,
+    /// Name shown to the receiver (used when streaming a staged temp file whose
+    /// on-disk name is a random session id, or an outbox copy).
+    display_name: Option<&'a str>,
+    /// Local path stored on the sent chat message for click-to-open, or `None`
+    /// when the source is transient and has no stable path.
+    record_path: Option<&'a str>,
+    /// Fixed transfer id. The outbox worker registers it before streaming so a
+    /// removal can cancel the live stream. `None` = fresh id.
+    transfer_id: Option<String>,
+    /// Queued chat message to update in place on delivery, instead of recording
+    /// a new "sent" message.
+    replaces_message: Option<&'a str>,
+}
+
+/// Per-peer result of `send_one_file`.
+#[derive(Default)]
+struct SendOutcome {
+    /// Transfer id used for this attempt's progress rows.
+    transfer_id: String,
+    delivered: Vec<String>,
+    /// Peers that could not be reached (dial or mid-stream network failure).
+    /// Nothing is recorded for them; the caller queues or re-queues the file.
+    unreachable: Vec<String>,
+    /// The source file could not be opened or read.
+    source_error: Option<String>,
+    cancelled: bool,
+}
+
+/// Connect to every target, stream a single file in chunks, and record the sent
+/// message. Best-effort per peer: an unreachable peer is reported back in
+/// `SendOutcome::unreachable` (no failure recorded); a cancel stops the stream and
+/// skips the chat record.
+fn send_one_file(
+    app: &AppHandle,
+    local_id: &str,
+    targets: &[(PeerDevice, String)],
+    send: FileSend,
+) -> SendOutcome {
+    let state = app.state::<AppState>();
+    let mut outcome = SendOutcome::default();
+    let transfer_id = send
+        .transfer_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    outcome.transfer_id = transfer_id.clone();
+    let source = Path::new(send.path);
+    let record_path = send.record_path;
+    let file_name = send
+        .display_name
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| file_name_of(send.path));
 
     let mut file = match fs::File::open(source) {
         Ok(file) => file,
@@ -1075,7 +1340,8 @@ fn send_one_file(
                     ),
                 );
             }
-            return;
+            outcome.source_error = Some(err.to_string());
+            return outcome;
         }
     };
     let total = file.metadata().map(|meta| meta.len()).unwrap_or(0);
@@ -1086,10 +1352,19 @@ fn send_one_file(
         cancels.insert(transfer_id.clone(), cancel.clone());
     }
 
-    // Open one connection per target and announce the file.
+    // Open one connection per target and announce the file. A peer that can't be
+    // reached gets no row here; the caller decides (queue it) and reports.
     let mut conns: Vec<PeerConn> = Vec::new();
     for (peer, secret) in targets {
-        match dial_peer(peer.host.as_str(), peer.port) {
+        let dialed = if peer.host.trim().is_empty() {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no address for peer",
+            ))
+        } else {
+            dial_peer(peer.host.as_str(), peer.port)
+        };
+        match dialed {
             Ok(mut stream) => {
                 let started = write_encrypted_line(
                     &mut stream,
@@ -1104,19 +1379,13 @@ fn send_one_file(
                 );
                 let error = started.err().map(|_| delivery_failure_text(&peer.name));
                 let failed = error.is_some();
-                let _ = emit_transfer(
-                    app,
-                    file_row(
-                        &transfer_id,
-                        peer,
-                        &file_name,
-                        0,
-                        if failed { "failed" } else { "sending" },
-                        error.clone(),
-                    ),
-                );
                 if failed {
                     let _ = mark_peer_offline(app, &state, &peer.id);
+                } else {
+                    let _ = emit_transfer(
+                        app,
+                        file_row(&transfer_id, peer, &file_name, 0, "sending", None),
+                    );
                 }
                 conns.push(PeerConn {
                     peer_id: peer.id.clone(),
@@ -1128,26 +1397,7 @@ fn send_one_file(
                 });
             }
             Err(_) => {
-                let error = delivery_failure_text(&peer.name);
-                let row = file_row(
-                    &transfer_id,
-                    peer,
-                    &file_name,
-                    0,
-                    "failed",
-                    Some(error.clone()),
-                );
-                persist_transfer_row(&state, row.clone());
-                let _ = emit_transfer(app, row);
-                let _ = record_failed_file_message(
-                    app,
-                    &state,
-                    peer.id.clone(),
-                    file_name.clone(),
-                    total,
-                    record_path,
-                    error,
-                );
+                outcome.unreachable.push(peer.id.clone());
                 let _ = mark_peer_offline(app, &state, &peer.id);
             }
         }
@@ -1197,22 +1447,12 @@ fn send_one_file(
                 );
                 if result.is_err() {
                     conn.failed = true;
-                    let error = delivery_failure_text(&conn.peer_name);
-                    conn.error = Some(error.clone());
-                    let _ = emit_transfer(
-                        app,
-                        peer_row(
-                            &transfer_id,
-                            &conn.peer_id,
-                            &conn.peer_name,
-                            &file_name,
-                            progress,
-                            "failed",
-                            Some(error),
-                        ),
-                    );
+                    conn.error = Some(delivery_failure_text(&conn.peer_name));
                     let _ = mark_peer_offline(app, &state, &conn.peer_id);
                 }
+            }
+            if !conns.iter().any(|conn| !conn.failed) {
+                break;
             }
             if progress as i32 != last_emitted {
                 last_emitted = progress as i32;
@@ -1273,58 +1513,91 @@ fn send_one_file(
     if let Ok(mut cancels) = state.cancels.lock() {
         cancels.remove(&transfer_id);
     }
+    outcome.cancelled = cancelled;
+    if read_failed {
+        outcome.source_error = Some("Could not read the file.".to_string());
+    }
 
     // Emit terminal rows, persist them, and record the sent chat message.
     for conn in &conns {
-        let (terminal, error) = if cancelled {
-            ("cancelled", None)
-        } else if read_failed {
-            ("failed", Some("Could not read the file.".to_string()))
-        } else if conn.failed {
-            (
+        if cancelled {
+            let row = peer_row(
+                &transfer_id,
+                &conn.peer_id,
+                &conn.peer_name,
+                &file_name,
+                100,
+                "cancelled",
+                None,
+            );
+            persist_transfer_row(&state, row.clone());
+            let _ = emit_transfer(app, row);
+            continue;
+        }
+        if read_failed {
+            let error = "Could not read the file.".to_string();
+            let row = peer_row(
+                &transfer_id,
+                &conn.peer_id,
+                &conn.peer_name,
+                &file_name,
+                100,
                 "failed",
-                conn.error
-                    .clone()
-                    .or_else(|| Some(delivery_failure_text(&conn.peer_name))),
-            )
-        } else {
-            ("complete", None)
-        };
+                Some(error.clone()),
+            );
+            persist_transfer_row(&state, row.clone());
+            let _ = emit_transfer(app, row);
+            if send.replaces_message.is_none() {
+                let _ = record_failed_file_message(
+                    app,
+                    &state,
+                    conn.peer_id.clone(),
+                    file_name.clone(),
+                    total,
+                    record_path,
+                    error,
+                );
+            }
+            continue;
+        }
+        if conn.failed {
+            // Network failure: the caller queues / re-queues this peer.
+            outcome.unreachable.push(conn.peer_id.clone());
+            continue;
+        }
+
         let row = peer_row(
             &transfer_id,
             &conn.peer_id,
             &conn.peer_name,
             &file_name,
             100,
-            terminal,
-            error.clone(),
+            "complete",
+            None,
         );
         persist_transfer_row(&state, row.clone());
         let _ = emit_transfer(app, row);
+        outcome.delivered.push(conn.peer_id.clone());
 
-        if !cancelled && !read_failed && !conn.failed {
-            let mut message =
-                make_chat_message(conn.peer_id.clone(), "sent", "file", file_name.clone());
-            // Both sides derive the same id (receiver does this in
-            // `receive_file_end`), so deleting the sent file message can retract
-            // the receiver's copy via DeleteMessage.
-            message.id = transfer_row_id(&transfer_id, &conn.peer_id);
-            message.file_name = Some(file_name.clone());
-            message.file_size = Some(total);
-            message.file_path = record_path.map(|p| p.to_string());
-            let _ = record_chat_message(app, &state, message);
-        } else if terminal == "failed" {
-            let _ = record_failed_file_message(
-                app,
-                &state,
-                conn.peer_id.clone(),
-                file_name.clone(),
-                total,
-                record_path,
-                error.unwrap_or_else(|| "Not delivered.".to_string()),
-            );
+        let mut message =
+            make_chat_message(conn.peer_id.clone(), "sent", "file", file_name.clone());
+        // Both sides derive the same id (receiver does this in
+        // `receive_file_end`), so deleting the sent file message can retract
+        // the receiver's copy via DeleteMessage.
+        message.id = transfer_row_id(&transfer_id, &conn.peer_id);
+        message.file_name = Some(file_name.clone());
+        message.file_size = Some(total);
+        message.file_path = record_path.map(|p| p.to_string());
+        match send.replaces_message {
+            Some(previous_id) => {
+                let _ = replace_chat_message(app, &state, previous_id, message);
+            }
+            None => {
+                let _ = record_chat_message(app, &state, message);
+            }
         }
     }
+    outcome
 }
 
 fn file_row(
@@ -1438,10 +1711,11 @@ fn cleanup_stale_staged_files() {
 
 /// Send a file previously assembled by `stage_file_chunk` to the given peers under
 /// its original name. Reuses the same chunked, cancelable streaming path as
-/// `send_files`. Small staged files (<= `MAX_SENDER_PERSIST_BYTES`) are first
-/// copied into the sender's Downloads so the sender can reopen them from chat
-/// (the chat record carries that path); larger ones stay transient and carry no
-/// chat path. The temp staging file is always removed afterward.
+/// `send_files`, including queueing for offline peers. Small staged files
+/// (<= `MAX_SENDER_PERSIST_BYTES`) are first copied into the sender's Downloads so
+/// the sender can reopen them from chat (the chat record carries that path);
+/// larger ones stay transient and carry no chat path. The temp staging file is
+/// always removed afterward (a queued large file keeps a private outbox copy).
 #[tauri::command]
 fn send_staged_file(
     app: AppHandle,
@@ -1458,27 +1732,7 @@ fn send_staged_file(
         return Err("Nothing was staged to send.".to_string());
     }
     let local_id = existing_device_id(&state)?;
-
-    // Resolve + validate targets up front, mirroring send_files, so problems surface
-    // synchronously instead of inside the worker thread.
-    let mut targets = Vec::new();
-    for peer_id in &peer_ids {
-        let peer = get_peer(&state, peer_id)?;
-        if peer.trust_state != "paired" {
-            return Err(format!("{} is not paired.", peer.name));
-        }
-        if peer.host.trim().is_empty() {
-            return Err(format!(
-                "{} does not have a network address yet.",
-                peer.name
-            ));
-        }
-        let secret = peer
-            .shared_secret
-            .clone()
-            .ok_or_else(|| format!("{} does not have a shared secret yet.", peer.name))?;
-        targets.push((peer, secret));
-    }
+    let targets = resolve_file_targets(&state, &peer_ids)?;
 
     let name = if file_name.trim().is_empty() {
         "file".to_string()
@@ -1496,17 +1750,519 @@ fn send_staged_file(
         let record_path = persisted
             .as_ref()
             .map(|dest| dest.to_string_lossy().to_string());
-        send_one_file(
+        // Only the temp staging file is transient; the Downloads copy is durable.
+        let transient = if persisted.is_some() {
+            None
+        } else {
+            Some(staged.as_path())
+        };
+        deliver_or_queue(
             &app,
             &local_id,
             &targets,
             &send_path,
             Some(&name),
             record_path.as_deref(),
+            transient,
         );
         let _ = fs::remove_file(&staged);
     });
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Offline outbox
+//
+// Files sent to a peer that is offline (or that drops mid-transfer) are queued in
+// `PersistedState::outbox` instead of failing. A background worker (`run_outbox`)
+// delivers them the next time the peer is reachable: it is kicked when discovery
+// sees a paired peer come back online and when a file is queued, and also wakes
+// every `OUTBOX_TICK` as a fallback. Each queued file is shown in chat as a
+// "queued" message that is updated in place once delivered.
+// ---------------------------------------------------------------------------
+
+fn queued_wait_text(peer_name: &str) -> String {
+    format!("Waiting for {peer_name} to come online. It will send automatically.")
+}
+
+/// Private dir (next to `state.json`) holding copies of transient sources, i.e.
+/// widget byte-drops whose temp staging file is deleted after the send attempt.
+fn outbox_dir(state: &State<AppState>) -> PathBuf {
+    outbox_dir_for(&state.path)
+}
+
+fn outbox_dir_for(state_path: &Path) -> PathBuf {
+    state_path
+        .parent()
+        .map(|dir| dir.join("outbox"))
+        .unwrap_or_else(|| std::env::temp_dir().join("simplepass-outbox"))
+}
+
+/// Move (or copy, across volumes) a transient file into the outbox dir and
+/// return its new path.
+fn copy_into_outbox(state: &State<AppState>, temp: &Path) -> AppResult<PathBuf> {
+    let dir = outbox_dir(state);
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("Could not queue the file for later: {err}"))?;
+    let dest = dir.join(Uuid::new_v4().to_string());
+    if fs::rename(temp, &dest).is_ok() {
+        return Ok(dest);
+    }
+    fs::copy(temp, &dest)
+        .map(|_| dest.clone())
+        .map_err(|err| {
+            let _ = fs::remove_file(&dest);
+            format!("Could not queue the file for later: {err}")
+        })
+}
+
+/// Delete an outbox-private source copy once no queued entry references it. The
+/// user's own files (anything outside the outbox dir) are never touched.
+fn cleanup_outbox_source(state: &State<AppState>, path: &str) {
+    let source = Path::new(path);
+    if !source.starts_with(outbox_dir(state)) {
+        return;
+    }
+    let referenced = state
+        .inner
+        .lock()
+        .map(|persisted| persisted.outbox.iter().any(|item| item.path == path))
+        .unwrap_or(true);
+    if !referenced {
+        let _ = fs::remove_file(source);
+    }
+}
+
+/// Startup reconciliation: a "queued" chat message whose outbox entry is gone
+/// (trimmed, or state edited) can never complete, so show it as failed; and
+/// remove outbox-dir copies no entry references any more.
+fn reconcile_outbox(state_path: &Path, persisted: &mut PersistedState) {
+    let queued_ids: std::collections::HashSet<String> = persisted
+        .outbox
+        .iter()
+        .map(|item| item.message_id.clone())
+        .collect();
+    for message in &mut persisted.messages {
+        if message.delivery_state == "queued" && !queued_ids.contains(&message.id) {
+            mark_message_failed(message, "Not delivered.".to_string());
+        }
+    }
+    let dir = outbox_dir_for(state_path);
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path().to_string_lossy().to_string();
+            if !persisted.outbox.iter().any(|item| item.path == path) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+fn emit_outbox(app: &AppHandle, state: &State<AppState>) {
+    if let Ok(persisted) = state.inner.lock() {
+        let _ = app.emit("outbox-changed", persisted.outbox.clone());
+    }
+}
+
+fn kick_outbox(state: &State<AppState>, kick: OutboxKick) {
+    // Full channel = a wake is already pending; the worker rescans everything.
+    let _ = state.outbox_kick.try_send(kick);
+}
+
+/// Queue a file for later delivery to `peer` and show it in chat as "queued".
+/// `row_transfer_id` is the transfer id of a failed live attempt, if any, so the
+/// "waiting" row replaces that attempt's progress row in the UI.
+fn enqueue_file(
+    app: &AppHandle,
+    state: &State<AppState>,
+    peer: &PeerDevice,
+    source: &str,
+    file_name: &str,
+    size: u64,
+    record_path: Option<&str>,
+    row_transfer_id: Option<&str>,
+) -> AppResult<()> {
+    let id = Uuid::new_v4().to_string();
+    let wait_text = queued_wait_text(&peer.name);
+    let mut message = make_chat_message(peer.id.clone(), "sent", "file", file_name.to_string());
+    message.id = transfer_row_id(&id, &peer.id);
+    message.file_name = Some(file_name.to_string());
+    message.file_size = Some(size);
+    message.file_path = record_path.map(|path| path.to_string());
+    message.delivery_state = "queued".to_string();
+    message.error = Some(wait_text.clone());
+    let item = QueuedFile {
+        id: id.clone(),
+        peer_id: peer.id.clone(),
+        path: source.to_string(),
+        file_name: file_name.to_string(),
+        size,
+        queued_at: now_ms(),
+        record_path: record_path.map(|path| path.to_string()),
+        message_id: message.id.clone(),
+        attempts: 0,
+        last_attempt: None,
+    };
+    {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        if persisted.outbox.len() >= MAX_OUTBOX_FILES {
+            return Err(format!(
+                "Not delivered. The offline queue is full ({MAX_OUTBOX_FILES} files)."
+            ));
+        }
+        persisted.outbox.push(item);
+        persisted.messages.push(message.clone());
+        trim_messages(&mut persisted);
+        save_state(&state.path, &persisted)?;
+    }
+    let _ = app.emit("chat-message", message);
+    emit_outbox(app, state);
+    let _ = emit_transfer(
+        app,
+        peer_row(
+            row_transfer_id.unwrap_or(&id),
+            &peer.id,
+            &peer.name,
+            file_name,
+            0,
+            "waiting",
+            Some(wait_text),
+        ),
+    );
+    kick_outbox(state, OutboxKick::Peer(peer.id.clone()));
+    Ok(())
+}
+
+/// Remove one entry from the outbox, returning it if it was still there.
+fn take_outbox_item(state: &State<AppState>, id: &str) -> Option<QueuedFile> {
+    let mut persisted = state.inner.lock().ok()?;
+    let index = persisted.outbox.iter().position(|item| item.id == id)?;
+    let item = persisted.outbox.remove(index);
+    let _ = save_state(&state.path, &persisted);
+    Some(item)
+}
+
+fn outbox_contains(state: &State<AppState>, id: &str) -> bool {
+    state
+        .inner
+        .lock()
+        .map(|persisted| persisted.outbox.iter().any(|item| item.id == id))
+        .unwrap_or(false)
+}
+
+/// If the worker is streaming this entry right now, trip that stream's cancel flag.
+fn cancel_inflight_outbox(state: &State<AppState>, id: &str) {
+    let transfer_id = state
+        .outbox_inflight
+        .lock()
+        .ok()
+        .and_then(|inflight| inflight.clone())
+        .filter(|(item_id, _)| item_id == id)
+        .map(|(_, transfer_id)| transfer_id);
+    if let Some(transfer_id) = transfer_id {
+        if let Ok(cancels) = state.cancels.lock() {
+            if let Some(flag) = cancels.get(&transfer_id) {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Replace a stored chat message (matched by `previous_id`) in place, keeping its
+/// position and original timestamp, and tell the UI via `message-updated`. Falls
+/// back to recording `message` as new if the original is gone (e.g. chat cleared).
+fn replace_chat_message(
+    app: &AppHandle,
+    state: &State<AppState>,
+    previous_id: &str,
+    mut message: ChatMessage,
+) -> AppResult<()> {
+    let replaced = {
+        let mut persisted = state.inner.lock().map_err(lock_err)?;
+        match persisted
+            .messages
+            .iter_mut()
+            .find(|existing| existing.id == previous_id)
+        {
+            Some(existing) => {
+                message.created_at = existing.created_at;
+                *existing = message.clone();
+                save_state(&state.path, &persisted)?;
+                true
+            }
+            None => false,
+        }
+    };
+    if !replaced {
+        return record_chat_message(app, state, message);
+    }
+    app.emit(
+        "message-updated",
+        serde_json::json!({ "previousId": previous_id, "message": message }),
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn fail_chat_message(app: &AppHandle, state: &State<AppState>, message_id: &str, error: String) {
+    let message = state.inner.lock().ok().and_then(|persisted| {
+        persisted
+            .messages
+            .iter()
+            .find(|message| message.id == message_id)
+            .cloned()
+    });
+    if let Some(mut message) = message {
+        mark_message_failed(&mut message, error);
+        let _ = replace_chat_message(app, state, message_id, message);
+    }
+}
+
+fn delete_local_message(app: &AppHandle, state: &State<AppState>, peer_id: &str, message_id: &str) {
+    let removed = state
+        .inner
+        .lock()
+        .map(|mut persisted| {
+            let before = persisted.messages.len();
+            persisted.messages.retain(|message| message.id != message_id);
+            let removed = persisted.messages.len() != before;
+            if removed {
+                let _ = save_state(&state.path, &persisted);
+            }
+            removed
+        })
+        .unwrap_or(false);
+    if removed {
+        let _ = app.emit(
+            "message-deleted",
+            serde_json::json!({ "peerId": peer_id, "messageId": message_id }),
+        );
+    }
+}
+
+/// Drop every queued file for `peer_id` (peer unpaired/removed), marking each
+/// queued chat message failed with `error`.
+fn fail_outbox_for_peer(app: &AppHandle, state: &State<AppState>, peer_id: &str, error: &str) {
+    let dropped: Vec<QueuedFile> = match state.inner.lock() {
+        Ok(mut persisted) => {
+            let dropped: Vec<QueuedFile> = persisted
+                .outbox
+                .iter()
+                .filter(|item| item.peer_id == peer_id)
+                .cloned()
+                .collect();
+            if !dropped.is_empty() {
+                persisted.outbox.retain(|item| item.peer_id != peer_id);
+                let _ = save_state(&state.path, &persisted);
+            }
+            dropped
+        }
+        Err(_) => return,
+    };
+    if dropped.is_empty() {
+        return;
+    }
+    for item in &dropped {
+        cancel_inflight_outbox(state, &item.id);
+        cleanup_outbox_source(state, &item.path);
+        fail_chat_message(app, state, &item.message_id, error.to_string());
+    }
+    emit_outbox(app, state);
+}
+
+#[tauri::command]
+fn list_outbox(state: State<AppState>) -> AppResult<Vec<QueuedFile>> {
+    Ok(state.inner.lock().map_err(lock_err)?.outbox.clone())
+}
+
+/// Remove a file from the outbox (stopping it if it is mid-delivery) and drop its
+/// "queued" chat bubble.
+#[tauri::command]
+fn remove_from_outbox(app: AppHandle, state: State<AppState>, id: String) -> AppResult<()> {
+    let Some(item) = take_outbox_item(&state, &id) else {
+        return Ok(());
+    };
+    cancel_inflight_outbox(&state, &item.id);
+    cleanup_outbox_source(&state, &item.path);
+    delete_local_message(&app, &state, &item.peer_id, &item.message_id);
+    emit_outbox(&app, &state);
+    Ok(())
+}
+
+/// Try every queued file now, ignoring retry backoff.
+#[tauri::command]
+fn retry_outbox(state: State<AppState>) -> AppResult<()> {
+    kick_outbox(&state, OutboxKick::Force);
+    Ok(())
+}
+
+/// Background worker that drains the outbox. Single-threaded on purpose: one
+/// worker means a queued file is never streamed twice concurrently.
+fn run_outbox(app: AppHandle, kicks: mpsc::Receiver<OutboxKick>) {
+    let mut last_attempt: HashMap<String, i64> = HashMap::new();
+    let mut urgent: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Let discovery refresh peer status after launch before the first pass.
+    thread::sleep(std::time::Duration::from_secs(4));
+    let mut force = false;
+    loop {
+        process_outbox(&app, &mut last_attempt, &mut urgent, force);
+        force = false;
+        let mut apply = |kick: OutboxKick, force: &mut bool| match kick {
+            OutboxKick::Peer(peer_id) => {
+                urgent.insert(peer_id);
+            }
+            OutboxKick::Force => *force = true,
+        };
+        match kicks.recv_timeout(OUTBOX_TICK) {
+            Ok(kick) => apply(kick, &mut force),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        while let Ok(kick) = kicks.try_recv() {
+            apply(kick, &mut force);
+        }
+    }
+}
+
+fn process_outbox(
+    app: &AppHandle,
+    last_attempt: &mut HashMap<String, i64>,
+    urgent: &mut std::collections::HashSet<String>,
+    force: bool,
+) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let Ok(local_id) = existing_device_id(&state) else {
+        return;
+    };
+    let (items, peers) = match state.inner.lock() {
+        Ok(persisted) => (persisted.outbox.clone(), persisted.peers.clone()),
+        Err(_) => return,
+    };
+    if items.is_empty() {
+        last_attempt.clear();
+        urgent.clear();
+        return;
+    }
+
+    // Peers in the order their oldest queued file was queued.
+    let mut peer_order: Vec<String> = Vec::new();
+    for item in &items {
+        if !peer_order.contains(&item.peer_id) {
+            peer_order.push(item.peer_id.clone());
+        }
+    }
+
+    for peer_id in peer_order {
+        let Some(peer) = peers.iter().find(|peer| peer.id == peer_id) else {
+            fail_outbox_for_peer(app, &state, &peer_id, "Not delivered. This device was removed.");
+            continue;
+        };
+        let secret = match (&peer.shared_secret, peer.trust_state.as_str()) {
+            (Some(secret), "paired") => secret.clone(),
+            _ => {
+                fail_outbox_for_peer(
+                    app,
+                    &state,
+                    &peer_id,
+                    "Not delivered. This device is no longer paired.",
+                );
+                continue;
+            }
+        };
+        let now = now_ms();
+        let gap = if peer.status == "online" || urgent.contains(&peer_id) {
+            OUTBOX_RETRY_MIN_MS
+        } else {
+            OUTBOX_OFFLINE_PROBE_MS
+        };
+        if let Some(last) = last_attempt.get(&peer_id) {
+            if !force && now - last < gap {
+                continue;
+            }
+        }
+        urgent.remove(&peer_id);
+        last_attempt.insert(peer_id.clone(), now);
+
+        for item in items.iter().filter(|item| item.peer_id == peer_id) {
+            if !outbox_contains(&state, &item.id) {
+                continue; // removed by the user since the snapshot
+            }
+            // Fresh peer record each time: the host may have changed.
+            let Ok(peer) = get_peer(&state, &peer_id) else {
+                break;
+            };
+            let transfer_id = Uuid::new_v4().to_string();
+            if let Ok(mut inflight) = state.outbox_inflight.lock() {
+                *inflight = Some((item.id.clone(), transfer_id.clone()));
+            }
+            if let Ok(mut persisted) = state.inner.lock() {
+                if let Some(entry) = persisted.outbox.iter_mut().find(|entry| entry.id == item.id) {
+                    entry.attempts += 1;
+                    entry.last_attempt = Some(now_ms());
+                }
+                let _ = save_state(&state.path, &persisted);
+            }
+            let outcome = send_one_file(
+                app,
+                &local_id,
+                &[(peer.clone(), secret.clone())],
+                FileSend {
+                    path: &item.path,
+                    display_name: Some(&item.file_name),
+                    record_path: item.record_path.as_deref(),
+                    transfer_id: Some(transfer_id.clone()),
+                    replaces_message: Some(&item.message_id),
+                },
+            );
+            if let Ok(mut inflight) = state.outbox_inflight.lock() {
+                *inflight = None;
+            }
+
+            if outcome.cancelled {
+                // Cancelled from the transfer row: stop and forget it, like a
+                // cancelled direct send (which leaves nothing in chat).
+                if let Some(removed) = take_outbox_item(&state, &item.id) {
+                    cleanup_outbox_source(&state, &removed.path);
+                }
+                delete_local_message(app, &state, &peer_id, &item.message_id);
+                emit_outbox(app, &state);
+            } else if let Some(err) = outcome.source_error {
+                if let Some(removed) = take_outbox_item(&state, &item.id) {
+                    cleanup_outbox_source(&state, &removed.path);
+                }
+                fail_chat_message(
+                    app,
+                    &state,
+                    &item.message_id,
+                    format!("Not delivered. The file could not be read: {err}"),
+                );
+                emit_outbox(app, &state);
+            } else if outcome.delivered.contains(&peer_id) {
+                if let Some(removed) = take_outbox_item(&state, &item.id) {
+                    cleanup_outbox_source(&state, &removed.path);
+                }
+                emit_outbox(app, &state);
+            } else {
+                // Still unreachable: keep it queued, clear any half-finished
+                // progress row, and stop trying this peer's remaining files.
+                let _ = emit_transfer(
+                    app,
+                    peer_row(
+                        &transfer_id,
+                        &peer_id,
+                        &peer.name,
+                        &item.file_name,
+                        0,
+                        "waiting",
+                        Some(queued_wait_text(&peer.name)),
+                    ),
+                );
+                emit_outbox(app, &state);
+                break;
+            }
+        }
+    }
 }
 
 /// Copy a staged temp file into the sender's Downloads under a non-colliding
@@ -1682,7 +2438,9 @@ pub fn run() {
             app.handle()
                 .plugin(tauri_plugin_updater::Builder::new().build())?;
             let path = app_data_file(app.handle())?;
-            let persisted = load_state(&path);
+            let mut persisted = load_state(&path);
+            reconcile_outbox(&path, &mut persisted);
+            let (outbox_kick, outbox_kicks) = mpsc::sync_channel(OUTBOX_KICK_CAPACITY);
             let launch_silently = is_background_launch();
             let _ = configure_autostart(app.handle(), persisted.setup.start_at_login);
             let widget = (
@@ -1700,6 +2458,8 @@ pub fn run() {
                 last_auto_open: Mutex::new(0),
                 widget_anchor: Mutex::new(None),
                 widget_active: AtomicBool::new(false),
+                outbox_kick,
+                outbox_inflight: Mutex::new(None),
             });
             build_tray(app.handle())?;
             if !launch_silently {
@@ -1718,6 +2478,8 @@ pub fn run() {
             }
             keep_widget_on_top(app.handle());
             start_transport(app.handle().clone());
+            let outbox_app = app.handle().clone();
+            thread::spawn(move || run_outbox(outbox_app, outbox_kicks));
             Ok(())
         })
         // Keep the app alive in the tray: closing the window hides it instead of quitting.
@@ -1746,6 +2508,9 @@ pub fn run() {
             stage_file_chunk,
             send_staged_file,
             cancel_file_send,
+            list_outbox,
+            remove_from_outbox,
+            retry_outbox,
             send_typing,
             clear_messages,
             clear_transfers,
@@ -2106,6 +2871,8 @@ fn upsert_peer_from_addr(
     if public_key_array(&packet.public_key).is_err() {
         return Ok(());
     }
+    // Set when a paired peer flips offline -> online, to wake the outbox worker.
+    let mut came_online = false;
     let peers = {
         let mut persisted = state.inner.lock().map_err(lock_err)?;
         let before_len = persisted.peers.len();
@@ -2132,6 +2899,7 @@ fn upsert_peer_from_addr(
                 {
                     material = true;
                 }
+                came_online = peer.status != "online" && peer.trust_state == "paired";
                 peer.name = packet.device_name.clone();
                 peer.host = host.clone();
                 peer.port = packet.port;
@@ -2171,6 +2939,9 @@ fn upsert_peer_from_addr(
         save_state(&state.path, &persisted)?;
         peers
     };
+    if came_online {
+        kick_outbox(state, OutboxKick::Peer(packet.device_id.clone()));
+    }
     app.emit("peers-changed", peers)
         .map_err(|err| err.to_string())
 }
@@ -4081,5 +4852,54 @@ mod tests {
         );
         assert_eq!(clamp_device_name("  Desk  "), "Desk");
         assert_eq!(clamp_device_name("   "), "Unknown device");
+    }
+
+    fn queued_message(id: &str) -> ChatMessage {
+        let mut message = make_chat_message("peer".to_string(), "sent", "file", "a.txt".to_string());
+        message.id = id.to_string();
+        message.delivery_state = "queued".to_string();
+        message
+    }
+
+    #[test]
+    fn reconcile_outbox_fails_orphaned_queued_messages() {
+        let dir = std::env::temp_dir().join(format!("simplepass-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(dir.join("outbox")).unwrap();
+        let kept_copy = dir.join("outbox").join("kept");
+        let orphan_copy = dir.join("outbox").join("orphan");
+        fs::write(&kept_copy, b"x").unwrap();
+        fs::write(&orphan_copy, b"x").unwrap();
+
+        let mut state = PersistedState::default();
+        state.messages.push(queued_message("live:peer"));
+        state.messages.push(queued_message("gone:peer"));
+        state.outbox.push(QueuedFile {
+            id: "live".to_string(),
+            peer_id: "peer".to_string(),
+            path: kept_copy.to_string_lossy().to_string(),
+            file_name: "a.txt".to_string(),
+            size: 1,
+            queued_at: 0,
+            record_path: None,
+            message_id: "live:peer".to_string(),
+            attempts: 0,
+            last_attempt: None,
+        });
+
+        reconcile_outbox(&dir.join("state.json"), &mut state);
+
+        assert_eq!(state.messages[0].delivery_state, "queued");
+        assert_eq!(state.messages[1].delivery_state, "failed");
+        assert!(kept_copy.exists());
+        assert!(!orphan_copy.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_state_without_outbox_still_loads() {
+        let mut value = serde_json::to_value(PersistedState::default()).unwrap();
+        value.as_object_mut().unwrap().remove("outbox");
+        let state: PersistedState = serde_json::from_value(value).unwrap();
+        assert!(state.outbox.is_empty());
     }
 }

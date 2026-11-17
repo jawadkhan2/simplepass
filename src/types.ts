@@ -37,13 +37,35 @@ export interface ChatMessage {
   fileSize?: number | null;
   filePath?: string | null;
   url?: string | null;
-  deliveryState?: "delivered" | "failed";
+  deliveryState?: "delivered" | "failed" | "queued";
   error?: string | null;
 }
 
 export interface MessageDeleted {
   peerId: string;
   messageId: string;
+}
+
+// A stored message changed in place (e.g. a queued file was delivered and took
+// its final id). `previousId` is the id the UI currently holds.
+export interface MessageUpdated {
+  previousId: string;
+  message: ChatMessage;
+}
+
+// A file waiting in the offline outbox for one peer; delivered automatically
+// the next time that peer is reachable.
+export interface QueuedFile {
+  id: string;
+  peerId: string;
+  path: string;
+  fileName: string;
+  size: number;
+  queuedAt: number;
+  recordPath?: string | null;
+  messageId: string;
+  attempts: number;
+  lastAttempt?: number | null;
 }
 
 export interface TypingSignal {
@@ -58,6 +80,8 @@ export interface TransferProgress {
   label: string;
   kind: "file" | "link";
   progress: number;
-  state: "queued" | "sending" | "complete" | "failed" | "cancelled";
+  // "waiting" = the file went to the offline outbox (see QueuedFile); the
+  // outbox list, not the transfer dock, shows it from then on.
+  state: "queued" | "sending" | "complete" | "failed" | "cancelled" | "waiting";
   error?: string;
 }

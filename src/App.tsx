@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Check,
+  Clock,
   Download,
   FileText,
   Image as ImageIcon,
@@ -32,7 +33,14 @@ import {
 import { api, events } from "./tauri";
 import { applyPendingUpdate, checkForUpdate, startAutoUpdate } from "./updater";
 import type { AvailableUpdate } from "./updater";
-import type { ChatMessage, PeerDevice, PeerStatus, SetupState, TransferProgress } from "./types";
+import type {
+  ChatMessage,
+  PeerDevice,
+  PeerStatus,
+  QueuedFile,
+  SetupState,
+  TransferProgress
+} from "./types";
 
 const TRANSFER_LIMIT = 8;
 const looksLikeUrl = (value: string) => /^https?:\/\/\S+$/i.test(value.trim());
@@ -185,6 +193,7 @@ export default function App() {
   const [chatPeerId, setChatPeerId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [transfers, setTransfers] = useState<TransferProgress[]>([]);
+  const [outbox, setOutbox] = useState<QueuedFile[]>([]);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pairingRequest, setPairingRequest] = useState<PeerDevice | null>(null);
@@ -234,9 +243,11 @@ export default function App() {
       }
     })();
     void api.listPeers().then(setPeers);
+    void api.listOutbox().then(setOutbox).catch(() => undefined);
 
     const unsubs = [
       events.onPeersChanged(setPeers),
+      events.onOutboxChanged(setOutbox),
       events.onPairingRequest(setPairingRequest),
       events.onSetupChanged(setSetup),
       events.onTransportError(setError),
@@ -244,9 +255,14 @@ export default function App() {
         // Read the open chat through a ref so this listener is set up once instead
         // of being torn down and rebuilt on every chat switch (peer updates arrive
         // separately via onPeersChanged).
-        setMessages((current) =>
-          message.peerId === chatPeerIdRef.current ? [...current, message] : current
-        );
+        setMessages((current) => {
+          if (message.peerId !== chatPeerIdRef.current) return current;
+          // Upsert: never show the same stored message twice.
+          if (current.some((item) => item.id === message.id)) {
+            return current.map((item) => (item.id === message.id ? message : item));
+          }
+          return [...current, message];
+        });
         // Toast incoming messages only when the window is hidden, so the user is
         // alerted without being interrupted while the app is already in front.
         // Clicking the toast surfaces the window (see the onAction effect below).
@@ -261,7 +277,21 @@ export default function App() {
             : current
         );
       }),
+      events.onMessageUpdated(({ previousId, message }) => {
+        // A queued file was delivered (or failed) and its bubble changed in place.
+        setMessages((current) =>
+          message.peerId === chatPeerIdRef.current
+            ? current.map((item) => (item.id === previousId ? message : item))
+            : current
+        );
+      }),
       events.onTransfer((transfer) => {
+        // A file that went to the offline outbox leaves the dock: the outbox list
+        // shows it until it is delivered.
+        if (transfer.state === "waiting") {
+          setTransfers((current) => current.filter((item) => item.id !== transfer.id));
+          return;
+        }
         // Completed rows are held for a beat so the success check can play. Failed
         // rows stay until dismissed so offline/asleep receiver cases are visible.
         setTransfers((current) => {
@@ -549,6 +579,7 @@ export default function App() {
                 onPair={() => api.pairPeer(peer.id).catch((err) => setError(String(err)))}
                 onChat={() => setChatPeerId(peer.id)}
                 onShare={() => openShareDialog(peer)}
+                queuedCount={outbox.filter((item) => item.peerId === peer.id).length}
               />
             ))}
             {peers.length === 0 && (
@@ -575,8 +606,16 @@ export default function App() {
         />
       </section>
 
-      {transfers.length > 0 && (
+      {(transfers.length > 0 || outbox.length > 0) && (
         <section className="transfer-dock">
+          {outbox.length > 0 && (
+            <OutboxList
+              outbox={outbox}
+              peers={peers}
+              onRemove={(id) => api.removeFromOutbox(id).catch((err) => setError(String(err)))}
+              onRetry={() => api.retryOutbox().catch((err) => setError(String(err)))}
+            />
+          )}
           {transfers.map((transfer) => (
             <div className={`transfer-row ${transfer.state}`} key={transfer.id}>
               <div>
@@ -701,6 +740,70 @@ function FirstRun({ onComplete }: { onComplete: (setup: SetupState) => void }) {
   );
 }
 
+// Files waiting in the offline outbox, grouped under one collapsible header.
+// Each is delivered automatically when its computer is next reachable.
+function OutboxList({
+  outbox,
+  peers,
+  onRemove,
+  onRetry
+}: {
+  outbox: QueuedFile[];
+  peers: PeerDevice[];
+  onRemove: (id: string) => void;
+  onRetry: () => void;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const peerName = (peerId: string) =>
+    peers.find((peer) => peer.id === peerId)?.name ?? "Unknown device";
+  const waitingFor = Array.from(new Set(outbox.map((item) => peerName(item.peerId))));
+
+  return (
+    <div className="outbox">
+      <div className="outbox-header">
+        <button
+          type="button"
+          className="outbox-toggle"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+        >
+          <Clock size={15} />
+          <strong>
+            {outbox.length} {outbox.length === 1 ? "file" : "files"} waiting to send
+          </strong>
+          <span>
+            {waitingFor.length === 1 ? `for ${waitingFor[0]}` : `to ${waitingFor.length} computers`}
+          </span>
+        </button>
+        <button type="button" className="outbox-retry" title="Try sending queued files now" onClick={onRetry}>
+          <RefreshCw size={13} />
+          Retry now
+        </button>
+      </div>
+      {expanded &&
+        outbox.map((item) => (
+          <div className="transfer-row waiting" key={item.id}>
+            <div>
+              <strong>{peerName(item.peerId)}</strong>
+              <span title={item.path}>{item.fileName}</span>
+            </div>
+            <div className="transfer-waiting"><Clock size={15} /> Queued</div>
+            <small title={item.lastAttempt ? `Last tried ${new Date(item.lastAttempt).toLocaleString()}` : undefined}>
+              {formatBytes(item.size)}
+            </small>
+            <button
+              className="transfer-cancel"
+              title="Remove from queue"
+              onClick={() => onRemove(item.id)}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        ))}
+    </div>
+  );
+}
+
 function DeviceTile(props: {
   peer: PeerDevice;
   selected: boolean;
@@ -709,6 +812,7 @@ function DeviceTile(props: {
   onPair: () => void;
   onChat: () => void;
   onShare: () => void;
+  queuedCount: number;
 }) {
   const { peer } = props;
   const paired = peer.trustState === "paired";
@@ -730,6 +834,15 @@ function DeviceTile(props: {
       <h3>{peer.name}</h3>
       <p>{peer.os || peer.host}{peer.host ? ` · ${peer.host}` : ""}</p>
       <span className={`status-dot ${peer.status}`}>{STATUS_LABEL[peer.status]}</span>
+      {props.queuedCount > 0 && (
+        <span
+          className="tile-queued"
+          title={`${props.queuedCount} queued ${props.queuedCount === 1 ? "file sends" : "files send"} when ${peer.name} is online`}
+        >
+          <Clock size={12} />
+          {props.queuedCount} queued
+        </span>
+      )}
       <div className="tile-actions">
         {paired ? (
           <>
@@ -822,10 +935,16 @@ function MessageBubble({
   onDelete: (message: ChatMessage) => void;
 }) {
   const failed = message.direction === "sent" && message.deliveryState === "failed";
+  const queued = message.direction === "sent" && message.deliveryState === "queued";
   const failureNote = failed ? (
     <span className="message-status">
       <AlertTriangle size={13} />
       {message.error ?? "Not delivered."}
+    </span>
+  ) : queued ? (
+    <span className="message-status queued">
+      <Clock size={13} />
+      {message.error ?? "Waiting to send."}
     </span>
   ) : null;
   // Deleting a sent message also retracts the peer's copy; deleting a received
@@ -835,9 +954,11 @@ function MessageBubble({
       type="button"
       className="message-delete"
       title={
-        message.direction === "sent" && message.deliveryState !== "failed"
-          ? "Delete for both devices"
-          : "Delete from this device"
+        queued
+          ? "Remove from queue"
+          : message.direction === "sent" && message.deliveryState !== "failed"
+            ? "Delete for both devices"
+            : "Delete from this device"
       }
       aria-label="Delete message"
       onClick={(event) => {
@@ -857,7 +978,7 @@ function MessageBubble({
       <div
         className={`message file-message ${message.direction}${openable ? " openable" : ""}${
           failed ? " failed" : ""
-        }`}
+        }${queued ? " queued" : ""}`}
         title={openable ? "Open file" : undefined}
         role={openable ? "button" : undefined}
         tabIndex={openable ? 0 : undefined}
@@ -1074,7 +1195,10 @@ function ChatPanel({
       {peerOffline && (
         <div className="offline-notice" role="status">
           <WifiOff size={16} />
-          <span>{peer.name} appears offline. Wake that PC and keep SimplePass running before retrying.</span>
+          <span>
+            {peer.name} appears offline. Files you send now are queued and go out automatically
+            when it's back; messages and links still need it online.
+          </span>
         </div>
       )}
       <div className="message-list">

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Check, Download, X } from "lucide-react";
+import { Check, Clock, Download, X } from "lucide-react";
 import { api, events } from "./tauri";
 import type { PeerDevice, TransferProgress } from "./types";
 import "./styles.css";
@@ -51,6 +51,7 @@ type Feedback =
   | { kind: "sending"; name: string }
   | { kind: "success"; name: string; detail: string }
   | { kind: "cancelled"; name: string }
+  | { kind: "queued"; name: string; detail: string }
   | { kind: "error"; message: string };
 
 // Tracks the terminal rows of one drop's worth of file transfers so we can report
@@ -62,9 +63,12 @@ type Batch = {
   done: Set<string>;
   success: number;
   cancelled: number;
+  queued: number;
 };
 
-const TERMINAL = ["complete", "failed", "cancelled"];
+// "waiting" = the peer was offline/unreachable and the file went to the outbox.
+const TERMINAL = ["complete", "failed", "cancelled", "waiting"];
+type TerminalKind = "complete" | "cancelled" | "failed" | "waiting";
 
 // Encode raw bytes as base64 for the staging IPC call. Chunked through
 // fromCharCode to avoid blowing the argument limit on large slices.
@@ -307,21 +311,24 @@ export default function FloatingIcon() {
     // batch's overall outcome once every file has finished. Also used for files
     // that failed before any transfer row existed (a staging/dispatch error),
     // so the batch can still resolve.
-    function recordDone(id: string, kind: "complete" | "cancelled" | "failed") {
+    function recordDone(id: string, kind: TerminalKind) {
       const current = batch.current;
       if (!current || current.done.has(id)) return;
       current.done.add(id);
       if (kind === "complete") current.success += 1;
       else if (kind === "cancelled") current.cancelled += 1;
+      else if (kind === "waiting") current.queued += 1;
       if (current.done.size < current.total) return;
 
-      const { name, success, cancelled } = current;
+      const { name, success, cancelled, queued } = current;
       batch.current = null;
       // A user-initiated cancel reads as "cancelled", not a failure. Completed
       // files still win (partial batch); only when nothing completed do cancel /
       // error states surface.
       if (success > 0) {
         setFeedback({ kind: "success", name, detail: success > 1 ? `${success} files` : "file" });
+      } else if (queued > 0) {
+        setFeedback({ kind: "queued", name, detail: queued > 1 ? `${queued} files` : "File" });
       } else if (cancelled > 0) {
         setFeedback({ kind: "cancelled", name });
       } else {
@@ -348,6 +355,7 @@ export default function FloatingIcon() {
           done: new Set(),
           success: 0,
           cancelled: 0,
+          queued: 0,
         };
       }
       locked.current = true;
@@ -454,7 +462,7 @@ export default function FloatingIcon() {
       const current = batch.current;
       if (current && transfer.peerId === current.peerId) {
         if (TERMINAL.includes(transfer.state)) {
-          recordDone(transfer.id, transfer.state as "complete" | "cancelled" | "failed");
+          recordDone(transfer.id, transfer.state as TerminalKind);
         }
         return;
       }
@@ -629,6 +637,16 @@ function StatusPill({ feedback }: { feedback: Feedback }) {
         <Check size={16} />
         <span className="fi-status-text">
           Sent {feedback.detail} to {feedback.name}
+        </span>
+      </div>
+    );
+  }
+  if (feedback.kind === "queued") {
+    return (
+      <div className="fi-status queued">
+        <Clock size={16} />
+        <span className="fi-status-text">
+          {feedback.detail} queued until {feedback.name} is online
         </span>
       </div>
     );
